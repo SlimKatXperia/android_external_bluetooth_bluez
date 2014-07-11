@@ -60,6 +60,8 @@ static GDBusProxy *default_ctrl;
 static GList *ctrl_list;
 static GList *dev_list;
 
+static guint input = 0;
+
 static const char * const agent_arguments[] = {
 	"on",
 	"off",
@@ -1386,11 +1388,20 @@ static gboolean signal_handler(GIOChannel *channel, GIOCondition condition,
 
 	switch (si.ssi_signo) {
 	case SIGINT:
-		rl_replace_line("", 0);
-		rl_crlf();
-		rl_on_new_line();
-		rl_redisplay();
-		break;
+		if (input) {
+			rl_replace_line("", 0);
+			rl_crlf();
+			rl_on_new_line();
+			rl_redisplay();
+			break;
+		}
+
+		/*
+		 * If input was not yet setup up that means signal was received
+		 * while daemon was not yet running. Since user is not able
+		 * to terminate client by CTRL-D or typing exit treat this as
+		 * exit and fall through.
+		 */
 	case SIGTERM:
 		if (__terminated == 0) {
 			rl_replace_line("", 0);
@@ -1464,12 +1475,19 @@ static GOptionEntry options[] = {
 	{ NULL },
 };
 
+static void client_ready(GDBusClient *client, void *user_data)
+{
+	guint *input = user_data;
+
+	*input = setup_standard_input();
+}
+
 int main(int argc, char *argv[])
 {
 	GOptionContext *context;
 	GError *error = NULL;
 	GDBusClient *client;
-	guint signal, input;
+	guint signal;
 
 	context = g_option_context_new(NULL);
 	g_option_context_add_main_entries(context, options, NULL);
@@ -1501,7 +1519,6 @@ int main(int argc, char *argv[])
 	rl_set_prompt(PROMPT_OFF);
 	rl_redisplay();
 
-	input = setup_standard_input();
 	signal = setup_signalfd();
 	client = g_dbus_client_new(dbus_conn, "org.bluez", "/org/bluez");
 
@@ -1512,11 +1529,15 @@ int main(int argc, char *argv[])
 	g_dbus_client_set_proxy_handlers(client, proxy_added, proxy_removed,
 							property_changed, NULL);
 
+	input = 0;
+	g_dbus_client_set_ready_watch(client, client_ready, &input);
+
 	g_main_loop_run(main_loop);
 
 	g_dbus_client_unref(client);
 	g_source_remove(signal);
-	g_source_remove(input);
+	if (input > 0)
+		g_source_remove(input);
 
 	rl_message("");
 	rl_callback_handler_remove();
