@@ -366,6 +366,21 @@ static const struct smp_data smp_client_basic_req_2_test = {
 	.mitm = true,
 };
 
+static void user_confirm_request_callback(uint16_t index, uint16_t length,
+							const void *param,
+							void *user_data)
+{
+	const struct mgmt_ev_user_confirm_request *ev = param;
+	struct test_data *data = tester_get_data();
+	struct mgmt_cp_user_confirm_reply cp;
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(&cp.addr, &ev->addr, sizeof(cp.addr));
+
+	mgmt_reply(data->mgmt, MGMT_OP_USER_CONFIRM_REPLY,
+			data->mgmt_index, sizeof(cp), &cp, NULL, NULL, NULL);
+}
+
 static void client_connectable_complete(uint16_t opcode, uint8_t status,
 					const void *param, uint8_t len,
 					void *user_data)
@@ -396,7 +411,7 @@ static void setup_powered_client_callback(uint8_t status, uint16_t length,
 
 	bthost = hciemu_client_get_host(data->hciemu);
 	bthost_set_cmd_complete_cb(bthost, client_connectable_complete, data);
-	bthost_set_adv_enable(bthost, 0x01);
+	bthost_set_adv_enable(bthost, 0x01, 0x00);
 }
 
 static void setup_powered_client(const void *test_data)
@@ -408,7 +423,7 @@ static void setup_powered_client(const void *test_data)
 
 	mgmt_send(data->mgmt, MGMT_OP_SET_LE, data->mgmt_index,
 				sizeof(param), param, NULL, NULL, NULL);
-	mgmt_send(data->mgmt, MGMT_OP_SET_PAIRABLE, data->mgmt_index,
+	mgmt_send(data->mgmt, MGMT_OP_SET_BONDABLE, data->mgmt_index,
 				sizeof(param), param, NULL, NULL, NULL);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 			sizeof(param), param, setup_powered_client_callback,
@@ -665,11 +680,15 @@ static void setup_powered_server(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 
+	mgmt_register(data->mgmt, MGMT_EV_USER_CONFIRM_REQUEST,
+			data->mgmt_index, user_confirm_request_callback,
+			data, NULL);
+
 	tester_print("Powering on controller");
 
 	mgmt_send(data->mgmt, MGMT_OP_SET_LE, data->mgmt_index,
 				sizeof(param), param, NULL, NULL, NULL);
-	mgmt_send(data->mgmt, MGMT_OP_SET_PAIRABLE, data->mgmt_index,
+	mgmt_send(data->mgmt, MGMT_OP_SET_BONDABLE, data->mgmt_index,
 				sizeof(param), param, NULL, NULL, NULL);
 	mgmt_send(data->mgmt, MGMT_OP_SET_CONNECTABLE, data->mgmt_index,
 				sizeof(param), param, NULL, NULL, NULL);

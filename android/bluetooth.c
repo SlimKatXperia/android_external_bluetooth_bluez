@@ -221,6 +221,8 @@ static GSList *browse_reqs;
 
 static struct ipc *hal_ipc = NULL;
 
+static bool kernel_conn_control = false;
+
 static void get_device_android_addr(struct device *dev, uint8_t *addr)
 {
 	/*
@@ -290,8 +292,7 @@ static void load_adapter_config(void)
 				"General", "DiscoverableTimeout", &gerr);
 	if (gerr) {
 		adapter.discoverable_timeout = DEFAULT_DISCOVERABLE_TIMEOUT;
-		g_error_free(gerr);
-		gerr = NULL;
+		g_clear_error(&gerr);
 	}
 
 	g_key_file_free(key_file);
@@ -1490,6 +1491,70 @@ bool bt_device_set_uuids(const bdaddr_t *addr, GSList *uuids)
 	return true;
 }
 
+bool bt_kernel_conn_control(void)
+{
+	return kernel_conn_control;
+}
+
+bool bt_auto_connect_add(const bdaddr_t *addr)
+{
+	struct mgmt_cp_add_device cp;
+	struct device *dev;
+
+	if (!kernel_conn_control)
+		return false;
+
+	dev = find_device(addr);
+	if (!dev)
+		return false;
+
+	if (dev->bdaddr_type == BDADDR_BREDR) {
+		DBG("auto-connection feature is not available for BR/EDR");
+		return false;
+	}
+
+	memset(&cp, 0, sizeof(cp));
+	bacpy(&cp.addr.bdaddr, addr);
+	cp.addr.type = dev->bdaddr_type;
+	cp.action = 0x02;
+
+	if (mgmt_send(mgmt_if, MGMT_OP_ADD_DEVICE, adapter.index, sizeof(cp),
+						&cp, NULL, NULL, NULL) > 0)
+		return true;
+
+	error("Failed to add device");
+
+	return false;
+}
+
+void bt_auto_connect_remove(const bdaddr_t *addr)
+{
+	struct mgmt_cp_remove_device cp;
+	struct device *dev;
+
+	if (!kernel_conn_control)
+		return;
+
+	dev = find_device(addr);
+	if (!dev)
+		return;
+
+	if (dev->bdaddr_type == BDADDR_BREDR) {
+		DBG("auto-connection feature is not available for BR/EDR");
+		return;
+	}
+
+	memset(&cp, 0, sizeof(cp));
+	bacpy(&cp.addr.bdaddr, addr);
+	cp.addr.type = dev->bdaddr_type;
+
+	if (mgmt_send(mgmt_if, MGMT_OP_REMOVE_DEVICE, adapter.index,
+					sizeof(cp), &cp, NULL, NULL, NULL) > 0)
+		return;
+
+	error("Failed to remove device");
+}
+
 static bool rssi_above_threshold(int old, int new)
 {
 	/* only 8 dBm or more */
@@ -2318,7 +2383,7 @@ static void load_ltks(GSList *ltks)
 	cp->key_count = htobs(ltk_count);
 
 	for (l = ltks, ltk = cp->keys; l != NULL; l = g_slist_next(l), ltk++)
-		memcpy(ltk, ltks->data, sizeof(*ltk));
+		memcpy(ltk, l->data, sizeof(*ltk));
 
 	if (mgmt_send(mgmt_if, MGMT_OP_LOAD_LONG_TERM_KEYS, adapter.index,
 			cp_size, cp, load_ltk_complete, NULL, NULL) == 0)
@@ -3064,6 +3129,34 @@ static void add_mps_record(void)
 	}
 }
 
+static void clear_auto_connect_list_complete(uint8_t status,
+							uint16_t length,
+							const void *param,
+							void *user_data)
+{
+	if (status != MGMT_STATUS_SUCCESS)
+		error("Failed to clear auto connect list: %s (0x%02x)",
+						mgmt_errstr(status), status);
+}
+
+static void clear_auto_connect_list(void)
+{
+	struct mgmt_cp_remove_device cp;
+
+	if (!kernel_conn_control)
+		return;
+
+	memset(&cp, 0, sizeof(cp));
+
+	if (mgmt_send(mgmt_if, MGMT_OP_REMOVE_DEVICE, adapter.index,
+					sizeof(cp), &cp,
+					clear_auto_connect_list_complete,
+					NULL, NULL) > 0)
+		return;
+
+	error("Could not clear auto connect list");
+}
+
 static void read_info_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -3121,6 +3214,7 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	register_mgmt_handlers();
 
 	clear_uuids();
+	clear_auto_connect_list();
 
 	set_io_capability();
 	set_device_id();
@@ -3135,8 +3229,8 @@ static void read_info_complete(uint8_t status, uint16_t length,
 	if (missing_settings & MGMT_SETTING_SECURE_CONN)
 		set_mode(MGMT_OP_SET_SECURE_CONN, 0x01);
 
-	if (missing_settings & MGMT_SETTING_PAIRABLE)
-		set_mode(MGMT_OP_SET_PAIRABLE, 0x01);
+	if (missing_settings & MGMT_SETTING_BONDABLE)
+		set_mode(MGMT_OP_SET_BONDABLE, 0x01);
 
 	load_devices_info(cb);
 	load_devices_cache();
@@ -3267,6 +3361,12 @@ static void read_version_complete(uint8_t status, uint16_t length,
 	if (MGMT_VERSION(mgmt_version, mgmt_revision) < MGMT_VERSION(1, 3)) {
 		error("Version 1.3 or later of management interface required");
 		goto failed;
+	}
+
+	/* Starting from mgmt 1.7, kernel can handle connection control */
+	if (MGMT_VERSION(mgmt_version, mgmt_revision) >= MGMT_VERSION(1, 7)) {
+		info("Kernel connection control will be used");
+		kernel_conn_control = true;
 	}
 
 	mgmt_register(mgmt_if, MGMT_EV_INDEX_ADDED, MGMT_INDEX_NONE,
@@ -3715,9 +3815,16 @@ bool bt_le_discovery_start(void)
 
 	adapter.le_scanning = true;
 
-	/* If core is discovering, don't bother */
-	if (adapter.cur_discovery_type != SCAN_TYPE_NONE)
+	/*
+	 * If core is discovering - just set expected next scan type.
+	 * It will be triggered in case current scan session is almost done
+	 * i.e. we missed LE phase in interleaved scan, or we're trying to
+	 * connect to device that was already discovered.
+	 */
+	if (adapter.cur_discovery_type != SCAN_TYPE_NONE) {
+		adapter.exp_discovery_type = SCAN_TYPE_LE;
 		return true;
+	}
 
 	if (start_discovery(SCAN_TYPE_LE))
 		return true;
@@ -3983,6 +4090,17 @@ static uint8_t select_device_bearer(struct device *dev)
 	}
 
 	return dev->bredr ? BDADDR_BREDR : dev->bdaddr_type;
+}
+
+uint8_t bt_device_last_seen_bearer(const bdaddr_t *bdaddr)
+{
+	 struct device *dev;
+
+	dev = find_device(bdaddr);
+	if (!dev)
+		return BDADDR_BREDR;
+
+	return select_device_bearer(dev);
 }
 
 static bool device_is_paired(struct device *dev, uint8_t addr_type)
@@ -4693,7 +4811,7 @@ static void handle_cancel_discovery_cmd(const void *buf, uint16_t len)
 		if (get_supported_discovery_type() != SCAN_TYPE_LE)
 			break;
 
-		if (gatt_device_found_cb) {
+		if (adapter.exp_discovery_type == SCAN_TYPE_LE) {
 			status = HAL_STATUS_BUSY;
 			goto failed;
 		}
@@ -4711,8 +4829,9 @@ static void handle_cancel_discovery_cmd(const void *buf, uint16_t len)
 			goto failed;
 		}
 
-		adapter.exp_discovery_type = gatt_device_found_cb ?
-						SCAN_TYPE_LE : SCAN_TYPE_NONE;
+		if (adapter.exp_discovery_type != SCAN_TYPE_LE)
+			adapter.exp_discovery_type = SCAN_TYPE_NONE;
+
 		break;
 	}
 

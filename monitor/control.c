@@ -154,7 +154,7 @@ static void mgmt_new_config_options(uint16_t len, const void *buf)
 
 static const char *settings_str[] = {
 	"powered", "connectable", "fast-connectable", "discoverable",
-	"pairable", "link-security", "ssp", "br/edr", "hs", "le",
+	"bondable", "link-security", "ssp", "br/edr", "hs", "le",
 	"advertising", "secure-conn", "debug-keys", "privacy",
 };
 
@@ -811,11 +811,11 @@ static void data_callback(int fd, uint32_t events, void *user_data)
 			packet_control(tv, index, opcode, data->buf, pktlen);
 			break;
 		case HCI_CHANNEL_MONITOR:
-			packet_monitor(tv, index, opcode, data->buf, pktlen);
 			btsnoop_write_hci(btsnoop_file, tv, index, opcode,
 							data->buf, pktlen);
 			ellisys_inject_hci(tv, index, opcode,
 							data->buf, pktlen);
+			packet_monitor(tv, index, opcode, data->buf, pktlen);
 			break;
 		}
 	}
@@ -996,9 +996,11 @@ void control_server(const char *path)
 	server_fd = fd;
 }
 
-void control_writer(const char *path)
+bool control_writer(const char *path)
 {
 	btsnoop_file = btsnoop_create(path, BTSNOOP_TYPE_MONITOR);
+
+	return !!btsnoop_file;
 }
 
 void control_reader(const char *path)

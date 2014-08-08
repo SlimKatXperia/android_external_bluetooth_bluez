@@ -41,6 +41,7 @@
 #include "uuid.h"
 #include "keys.h"
 #include "sdp.h"
+#include "avctp.h"
 
 #define MAX_CHAN 64
 
@@ -1112,6 +1113,21 @@ static const struct sig_opcode_data le_sig_opcode_table[] = {
 	{ },
 };
 
+static void l2cap_frame_init(struct l2cap_frame *frame,
+				uint16_t index, bool in, uint16_t handle,
+				uint16_t cid, const void *data, uint16_t size)
+{
+	frame->index  = index;
+	frame->in     = in;
+	frame->handle = handle;
+	frame->cid    = cid;
+	frame->data   = data;
+	frame->size   = size;
+	frame->psm    = get_psm(frame);
+	frame->mode   = get_mode(frame);
+	frame->chan   = get_chan(frame);
+}
+
 static void bredr_sig_packet(uint16_t index, bool in, uint16_t handle,
 				uint16_t cid, const void *data, uint16_t size)
 {
@@ -1882,7 +1898,7 @@ static const char *att_format_str(uint8_t format)
 	}
 }
 
-static uint16_t print_info_data_16(const uint16_t *data, uint16_t len)
+static uint16_t print_info_data_16(const void *data, uint16_t len)
 {
 	while (len >= 4) {
 		print_field("Handle: 0x%4.4x", get_le16(data));
@@ -1894,7 +1910,7 @@ static uint16_t print_info_data_16(const uint16_t *data, uint16_t len)
 	return len;
 }
 
-static uint16_t print_info_data_128(const uint16_t *data, uint16_t len)
+static uint16_t print_info_data_128(const void *data, uint16_t len)
 {
 	while (len >= 18) {
 		print_field("Handle: 0x%4.4x", get_le16(data));
@@ -2595,8 +2611,6 @@ static void l2cap_frame(uint16_t index, bool in, uint16_t handle,
 			uint16_t cid, const void *data, uint16_t size)
 {
 	struct l2cap_frame frame;
-	uint16_t psm, chan;
-	uint8_t mode;
 
 	switch (cid) {
 	case 0x0001:
@@ -2619,20 +2633,22 @@ static void l2cap_frame(uint16_t index, bool in, uint16_t handle,
 		break;
 	default:
 		l2cap_frame_init(&frame, index, in, handle, cid, data, size);
-		psm = get_psm(&frame);
-		mode = get_mode(&frame);
-		chan = get_chan(&frame);
 
 		print_indent(6, COLOR_CYAN, "Channel:", "", COLOR_OFF,
 				" %d len %d [PSM %d mode %d] {chan %d}",
-						cid, size, psm, mode, chan);
+						cid, size, frame.psm,
+						frame.mode, frame.chan);
 
-		switch (psm) {
+		switch (frame.psm) {
 		case 0x0001:
-			sdp_packet(&frame, chan);
+			sdp_packet(&frame);
 			break;
 		case 0x001f:
 			att_packet(index, in, handle, cid, data, size);
+			break;
+		case 0x0017:
+		case 0x001B:
+			avctp_packet(&frame);
 			break;
 		default:
 			packet_hexdump(data, size);

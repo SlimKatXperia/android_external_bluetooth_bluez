@@ -35,6 +35,7 @@
 #include "ipc.h"
 #include "ipc-common.h"
 #include "lib/sdp.h"
+#include "lib/sdp_lib.h"
 #include "lib/uuid.h"
 #include "bluetooth.h"
 #include "gatt.h"
@@ -67,6 +68,7 @@
 #define GATT_PERM_WRITE_AUTHORIZATION	0x00000800
 #define GATT_PERM_WRITE_SIGNED		0x00010000
 #define GATT_PERM_WRITE_SIGNED_MITM	0x00020000
+#define GATT_PERM_NONE			0x10000000
 
 #define GATT_CONN_TIMEOUT 2
 
@@ -176,6 +178,11 @@ struct app_connection {
 	bool wait_execute_write;
 };
 
+struct service_sdp {
+	int32_t service_handle;
+	uint32_t sdp_handle;
+};
+
 static struct ipc *hal_ipc = NULL;
 static bdaddr_t adapter_addr;
 static bool scanning = false;
@@ -185,12 +192,19 @@ static struct queue *gatt_apps = NULL;
 static struct queue *gatt_devices = NULL;
 static struct queue *app_connections = NULL;
 
+static struct queue *services_sdp = NULL;
+
 static struct queue *listen_apps = NULL;
 static struct gatt_db *gatt_db = NULL;
 
 static uint16_t service_changed_handle = 0;
 
-static GIOChannel *listening_io = NULL;
+static GIOChannel *le_io = NULL;
+static GIOChannel *bredr_io = NULL;
+
+static uint32_t gatt_sdp_handle = 0;
+static uint32_t gap_sdp_handle = 0;
+static uint32_t dis_sdp_handle = 0;
 
 static struct bt_crypto *crypto = NULL;
 
@@ -1123,28 +1137,28 @@ static void discover_srvc_by_uuid_cb(uint8_t status, GSList *ranges,
 	}
 
 	bt_uuid_to_string(&cb_data->uuid, prim.uuid, sizeof(prim.uuid));
-	/*
-	 * If multiple instances of the same service (as identified by UUID)
-	 * exist, the first instance of the service is returned.
-	 */
-	memcpy(&prim.range, ranges->data, sizeof(prim.range));
 
-	s = create_service(instance_id++, true, prim.uuid, &prim);
-	if (!s) {
-		gatt_status = GATT_FAILURE;
-		goto reply;
+	for (; ranges; ranges = ranges->next) {
+		memcpy(&prim.range, ranges->data, sizeof(prim.range));
+
+		s = create_service(instance_id++, true, prim.uuid, &prim);
+		if (!s) {
+			gatt_status = GATT_FAILURE;
+			goto reply;
+		}
+
+		if (!queue_push_tail(dev->services, s)) {
+			error("gatt: Cannot push primary service to the list");
+			destroy_service(s);
+			gatt_status = GATT_FAILURE;
+			goto reply;
+		}
+
+		send_client_primary_notify(s, INT_TO_PTR(cb_data->conn->id));
+
+		DBG("attr handle = 0x%04x, end grp handle = 0x%04x uuid: %s",
+				prim.range.start, prim.range.end, prim.uuid);
 	}
-
-	if (!queue_push_tail(dev->services, s)) {
-		error("gatt: Cannot push primary service to the list");
-		gatt_status = GATT_FAILURE;
-		goto reply;
-	}
-
-	send_client_primary_notify(s, INT_TO_PTR(cb_data->conn->id));
-
-	DBG("attr handle = 0x%04x, end grp handle = 0x%04x uuid: %s",
-		prim.range.start, prim.range.end, prim.uuid);
 
 	/* Partial search service scanning was performed */
 	dev->partial_srvc_search = true;
@@ -1369,6 +1383,8 @@ static void connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 
 	device_set_state(dev, DEVICE_CONNECTED);
 
+	bt_auto_connect_remove(&dev->bdaddr);
+
 	/* Send exchange mtu request as we assume being client and server */
 	/* TODO: Dont exchange mtu if no client apps */
 	send_exchange_mtu_request(dev);
@@ -1419,7 +1435,6 @@ reply:
 
 static int connect_le(struct gatt_device *dev)
 {
-	BtIOSecLevel sec_level;
 	GIOChannel *io;
 	GError *gerr = NULL;
 	char addr[18];
@@ -1435,9 +1450,6 @@ static int connect_le(struct gatt_device *dev)
 	}
 
 	DBG("Connection attempt to: %s", addr);
-
-	sec_level = bt_device_is_bonded(&dev->bdaddr) ? BT_IO_SEC_MEDIUM :
-								BT_IO_SEC_LOW;
 
 	/*
 	 * If address type is random it might be that IRK was received and
@@ -1464,7 +1476,7 @@ static int connect_le(struct gatt_device *dev)
 			BT_IO_OPT_DEST_BDADDR, bdaddr,
 			BT_IO_OPT_DEST_TYPE, bdaddr_type,
 			BT_IO_OPT_CID, ATT_CID,
-			BT_IO_OPT_SEC_LEVEL, sec_level,
+			BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
 			BT_IO_OPT_INVALID);
 	if (!io) {
 		error("gatt: Failed bt_io_connect(%s): %s", addr,
@@ -1519,6 +1531,10 @@ static void le_device_found_handler(const bdaddr_t *addr, uint8_t addr_type,
 						sizeof(*ev) + ev->len, ev);
 
 connect:
+	/* We use auto connect feature from kernel if possible */
+	if (bt_kernel_conn_control())
+		return;
+
 	dev = find_device_by_addr(addr);
 	if (!dev) {
 		if (!bonded)
@@ -1696,28 +1712,108 @@ static void app_disconnect_devices(struct gatt_app *client)
 	}
 }
 
+static int connect_bredr(struct gatt_device *dev)
+{
+	BtIOSecLevel sec_level;
+	GIOChannel *io;
+	GError *gerr = NULL;
+	char addr[18];
+
+	ba2str(&dev->bdaddr, addr);
+
+	/* There is one connection attempt going on */
+	if (dev->att_io) {
+		info("gatt: connection to dev %s is ongoing", addr);
+		return -EALREADY;
+	}
+
+	DBG("Connection attempt to: %s", addr);
+
+	sec_level = bt_device_is_bonded(&dev->bdaddr) ? BT_IO_SEC_MEDIUM :
+								BT_IO_SEC_LOW;
+
+	io = bt_io_connect(connect_cb, device_ref(dev), NULL, &gerr,
+			BT_IO_OPT_SOURCE_BDADDR, &adapter_addr,
+			BT_IO_OPT_SOURCE_TYPE, BDADDR_BREDR,
+			BT_IO_OPT_DEST_BDADDR, &dev->bdaddr,
+			BT_IO_OPT_DEST_TYPE, BDADDR_BREDR,
+			BT_IO_OPT_PSM, ATT_PSM,
+			BT_IO_OPT_SEC_LEVEL, sec_level,
+			BT_IO_OPT_INVALID);
+	if (!io) {
+		error("gatt: Failed bt_io_connect(%s): %s", addr,
+							gerr->message);
+		g_error_free(gerr);
+		return -EIO;
+	}
+
+	device_set_state(dev, DEVICE_CONNECT_READY);
+
+	/* Keep this, so we can cancel the connection */
+	dev->att_io = io;
+
+	return 0;
+}
+
+static bool auto_connect(struct gatt_device *dev)
+{
+	bool err;
+
+	err = bt_auto_connect_add(&dev->bdaddr);
+	if (!err)
+		return false;
+
+	device_set_state(dev, DEVICE_CONNECT_INIT);
+
+	return true;
+}
+
 static bool trigger_connection(struct app_connection *connection)
 {
+	bool ret;
+
 	switch (connection->device->state) {
 	case DEVICE_DISCONNECTED:
+		/*
+		 *  If device was last seen over BR/EDR connect over it.
+		 *  Note: Connection state is handled in connect_bredr() func
+		 */
+		if (bt_device_last_seen_bearer(&connection->device->bdaddr) ==
+								BDADDR_BREDR)
+			return connect_bredr(connection->device) == 0;
+
+		/*
+		 * For LE devices use auto connect feature if possible
+		 * Note: Connection state is handled inside auto_connect() func
+		 */
+		if (bt_kernel_conn_control())
+			return auto_connect(connection->device);
+
+		/* Trigger discovery if not already started */
+		if (!scanning) {
+			if (!bt_le_discovery_start()) {
+				error("gatt: Could not start scan");
+				ret = false;
+				break;
+			}
+		}
+
+		ret = true;
 		device_set_state(connection->device, DEVICE_CONNECT_INIT);
 		break;
 	case DEVICE_CONNECTED:
 		send_app_connect_notify(connection, GATT_SUCCESS);
+		ret = true;
 		break;
+	case DEVICE_CONNECT_READY:
+	case DEVICE_CONNECT_INIT:
 	default:
+		/* In those cases connection is already triggered. */
+		ret = true;
 		break;
 	}
 
-	/* after state change trigger discovering */
-	if (!scanning && (connection->device->state == DEVICE_CONNECT_INIT))
-		if (!bt_le_discovery_start()) {
-			error("gatt: Could not start scan");
-
-			return false;
-		}
-
-	return true;
+	return ret;
 }
 
 static uint8_t unregister_app(int client_if)
@@ -2707,11 +2803,12 @@ static void send_client_read_char_notify(int32_t status, const uint8_t *pdu,
 
 	ev->conn_id = conn_id;
 	ev->status = status;
+	ev->data.status = status;
 
 	element_id_to_hal_srvc_id(s_id, primary, &ev->data.srvc_id);
 	element_id_to_hal_gatt_id(ch_id, &ev->data.char_id);
 
-	if (pdu) {
+	if (status == 0 && pdu) {
 		vlen = dec_read_resp(pdu, len, ev->data.value, sizeof(buf));
 		if (vlen < 0) {
 			error("gatt: Protocol error");
@@ -2738,6 +2835,21 @@ static void read_char_cb(guint8 status, const guint8 *pdu, guint16 len,
 	free(data);
 }
 
+static int get_cid(struct gatt_device *dev)
+{
+	GIOChannel *io;
+	int cid;
+
+	io = g_attrib_get_channel(dev->attrib);
+
+	if (!bt_io_get(io, NULL, BT_IO_OPT_CID, &cid, BT_IO_OPT_INVALID)) {
+		error("gatt: Failed to get CID");
+		return -1;
+	}
+
+	return cid;
+}
+
 static int get_sec_level(struct gatt_device *dev)
 {
 	GIOChannel *io;
@@ -2754,26 +2866,11 @@ static int get_sec_level(struct gatt_device *dev)
 	return sec_level;
 }
 
-static bool set_security(struct gatt_device *device, int auth_type)
+static bool set_security(struct gatt_device *device, int req_sec_level)
 {
-	int req_sec_level, sec_level;
+	int sec_level;
 	GError *gerr = NULL;
 	GIOChannel *io;
-
-	switch (auth_type) {
-	case HAL_GATT_AUTHENTICATION_MITM:
-		req_sec_level = BT_SECURITY_HIGH;
-		break;
-	case HAL_GATT_AUTHENTICATION_NO_MITM:
-		req_sec_level = BT_SECURITY_MEDIUM;
-		break;
-	case HAL_GATT_AUTHENTICATION_NONE:
-		req_sec_level = BT_SECURITY_LOW;
-		break;
-	default:
-		error("gatt: Invalid auth_type value: %d", auth_type);
-		return false;
-	}
 
 	sec_level = get_sec_level(device);
 	if (sec_level < 0)
@@ -2795,6 +2892,39 @@ static bool set_security(struct gatt_device *device, int auth_type)
 	}
 
 	return true;
+}
+
+bool bt_gatt_set_security(const bdaddr_t *bdaddr, int sec_level)
+{
+	struct gatt_device *device;
+
+	device = find_device_by_addr(bdaddr);
+	if (!device)
+		return false;
+
+	return set_security(device, sec_level);
+}
+
+static bool set_auth_type(struct gatt_device *device, int auth_type)
+{
+	int sec_level;
+
+	switch (auth_type) {
+	case HAL_GATT_AUTHENTICATION_MITM:
+		sec_level = BT_SECURITY_HIGH;
+		break;
+	case HAL_GATT_AUTHENTICATION_NO_MITM:
+		sec_level = BT_SECURITY_MEDIUM;
+		break;
+	case HAL_GATT_AUTHENTICATION_NONE:
+		sec_level = BT_SECURITY_LOW;
+		break;
+	default:
+		error("gatt: Invalid auth_type value: %d", auth_type);
+		return false;
+	}
+
+	return set_security(device, sec_level);
 }
 
 static void handle_client_read_characteristic(const void *buf, uint16_t len)
@@ -2837,7 +2967,7 @@ static void handle_client_read_characteristic(const void *buf, uint16_t len)
 		goto failed;
 	}
 
-	if (!set_security(conn->device, cmd->auth_req)) {
+	if (!set_auth_type(conn->device, cmd->auth_req)) {
 		error("gatt: Failed to set security %d", cmd->auth_req);
 		status = HAL_STATUS_FAILED;
 		free(cb_data);
@@ -2900,28 +3030,30 @@ static void write_char_cb(guint8 status, const guint8 *pdu, guint16 len,
 	free(data);
 }
 
-static bool signed_write_cmd(struct gatt_device *dev, uint16_t handle,
+static guint signed_write_cmd(struct gatt_device *dev, uint16_t handle,
 					const uint8_t *value, uint16_t vlen)
 {
 	uint8_t csrk[16];
 	uint32_t sign_cnt;
+	guint res;
 
 	memset(csrk, 0, 16);
 
 	if (!bt_get_csrk(&dev->bdaddr, LOCAL_CSRK, csrk, &sign_cnt)) {
 		error("gatt: Could not get csrk key");
-		return false;
+		return 0;
 	}
 
-	if (!gatt_signed_write_cmd(dev->attrib, handle, value, vlen, crypto,
-					csrk, sign_cnt, NULL, NULL)) {
+	res = gatt_signed_write_cmd(dev->attrib, handle, value, vlen, crypto,
+						csrk, sign_cnt, NULL, NULL);
+	if (!res) {
 		error("gatt: Could write signed cmd");
-		return false;
+		return 0;
 	}
 
 	bt_update_sign_counter(&dev->bdaddr, LOCAL_CSRK);
 
-	return true;
+	return res;
 }
 
 static void handle_client_write_characteristic(const void *buf, uint16_t len)
@@ -2972,7 +3104,7 @@ static void handle_client_write_characteristic(const void *buf, uint16_t len)
 		}
 	}
 
-	if (!set_security(conn->device, cmd->auth_req)) {
+	if (!set_auth_type(conn->device, cmd->auth_req)) {
 		error("gatt: Failed to set security %d", cmd->auth_req);
 		status = HAL_STATUS_FAILED;
 		goto failed;
@@ -2996,14 +3128,20 @@ static void handle_client_write_characteristic(const void *buf, uint16_t len)
 							write_char_cb, cb_data);
 		break;
 	case GATT_WRITE_TYPE_SIGNED:
+		if (get_cid(conn->device) != ATT_CID) {
+			error("gatt: Cannot write signed on BR/EDR bearer");
+			status = HAL_STATUS_FAILED;
+			goto failed;
+		}
+
 		if (get_sec_level(conn->device) != BT_SECURITY_LOW) {
 			error("gatt: Cannot write signed on encrypted link");
-			res = HAL_STATUS_FAILED;
-		} else {
-			res = signed_write_cmd(conn->device,
-							ch->ch.value_handle,
-							cmd->value, cmd->len);
+			status = HAL_STATUS_FAILED;
+			goto failed;
 		}
+
+		res = signed_write_cmd(conn->device, ch->ch.value_handle,
+							cmd->value, cmd->len);
 		break;
 	default:
 		error("gatt: Write type %d unsupported", cmd->write_type);
@@ -3029,7 +3167,8 @@ failed:
 	 * of error and write with no response
 	 */
 	if (status != HAL_STATUS_SUCCESS ||
-			cmd->write_type == GATT_WRITE_TYPE_NO_RESPONSE) {
+			cmd->write_type == GATT_WRITE_TYPE_NO_RESPONSE ||
+			cmd->write_type == GATT_WRITE_TYPE_SIGNED) {
 		int32_t gatt_status = (status == HAL_STATUS_SUCCESS) ?
 						GATT_SUCCESS : GATT_FAILURE;
 
@@ -3054,12 +3193,13 @@ static void send_client_descr_read_notify(int32_t status, const uint8_t *pdu,
 
 	ev->status = status;
 	ev->conn_id = conn_id;
+	ev->data.status = ev->status;
 
 	element_id_to_hal_srvc_id(srvc, primary, &ev->data.srvc_id);
 	element_id_to_hal_gatt_id(ch, &ev->data.char_id);
 	element_id_to_hal_gatt_id(descr, &ev->data.descr_id);
 
-	if (len && pdu) {
+	if (status == 0 && pdu) {
 		ssize_t ret;
 
 		ret = dec_read_resp(pdu, len, ev->data.value,
@@ -3179,7 +3319,7 @@ static void handle_client_read_descriptor(const void *buf, uint16_t len)
 		goto failed;
 	}
 
-	if (!set_security(conn->device, cmd->auth_req)) {
+	if (!set_auth_type(conn->device, cmd->auth_req)) {
 		error("gatt: Failed to set security %d", cmd->auth_req);
 		status = HAL_STATUS_FAILED;
 		free(cb_data);
@@ -3311,7 +3451,7 @@ static void handle_client_write_descriptor(const void *buf, uint16_t len)
 		}
 	}
 
-	if (!set_security(conn->device, cmd->auth_req)) {
+	if (!set_auth_type(conn->device, cmd->auth_req)) {
 		error("gatt: Failed to set security %d", cmd->auth_req);
 		status = HAL_STATUS_FAILED;
 		goto failed;
@@ -3794,7 +3934,7 @@ static uint8_t test_increase_security(bdaddr_t *bdaddr, uint16_t u1)
 	if (!device)
 		return HAL_STATUS_FAILED;
 
-	if (!set_security(device, u1))
+	if (!set_auth_type(device, u1))
 		return HAL_STATUS_FAILED;
 
 	return HAL_STATUS_SUCCESS;
@@ -4403,7 +4543,7 @@ static void read_requested_attributes(void *data, void *user_data)
 	struct pending_request *resp_data = data;
 	struct request_processing_data *process_data = user_data;
 	uint32_t permissions;
-	uint8_t *value, error;
+	uint8_t *value = NULL, error;
 	int value_len = 0;
 
 	if (!gatt_db_get_attribute_permissions(gatt_db, resp_data->handle,
@@ -4423,8 +4563,11 @@ static void read_requested_attributes(void *data, void *user_data)
 	error = check_device_permissions(process_data->device,
 							process_data->opcode,
 							permissions);
-	if (error)
-		goto done;
+	if (error != 0) {
+		resp_data->error = error;
+		resp_data->state = REQUEST_DONE;
+		return;
+	}
 
 	resp_data->state = REQUEST_PENDING;
 
@@ -4432,14 +4575,11 @@ static void read_requested_attributes(void *data, void *user_data)
 						resp_data->offset,
 						process_data->opcode,
 						&process_data->device->bdaddr,
-						&value, &value_len)) {
+						&value, &value_len))
 		error = ATT_ECODE_UNLIKELY;
-		goto done;
-	}
 
-done:
 	/* We have value here already if no callback will be called */
-	if (value_len > 0)
+	if (value_len >= 0)
 		fill_gatt_response(resp_data, resp_data->handle,
 					resp_data->offset, error, value_len,
 					value);
@@ -4742,6 +4882,171 @@ static void notify_service_change(void *data, void *user_data)
 	notify_att_range_change(data, &range);
 }
 
+static sdp_record_t *get_sdp_record(uuid_t *uuid, uint16_t start, uint16_t end,
+							const char *name)
+{
+	sdp_list_t *svclass_id, *apseq, *proto[2], *root, *aproto;
+	uuid_t root_uuid, proto_uuid, l2cap;
+	sdp_record_t *record;
+	sdp_data_t *psm, *sh, *eh;
+	uint16_t lp = ATT_PSM;
+
+	record = sdp_record_alloc();
+	if (record == NULL)
+		return NULL;
+
+	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
+	root = sdp_list_append(NULL, &root_uuid);
+	sdp_set_browse_groups(record, root);
+	sdp_list_free(root, NULL);
+
+	svclass_id = sdp_list_append(NULL, uuid);
+	sdp_set_service_classes(record, svclass_id);
+	sdp_list_free(svclass_id, NULL);
+
+	sdp_uuid16_create(&l2cap, L2CAP_UUID);
+	proto[0] = sdp_list_append(NULL, &l2cap);
+	psm = sdp_data_alloc(SDP_UINT16, &lp);
+	proto[0] = sdp_list_append(proto[0], psm);
+	apseq = sdp_list_append(NULL, proto[0]);
+
+	sdp_uuid16_create(&proto_uuid, ATT_UUID);
+	proto[1] = sdp_list_append(NULL, &proto_uuid);
+	sh = sdp_data_alloc(SDP_UINT16, &start);
+	proto[1] = sdp_list_append(proto[1], sh);
+	eh = sdp_data_alloc(SDP_UINT16, &end);
+	proto[1] = sdp_list_append(proto[1], eh);
+	apseq = sdp_list_append(apseq, proto[1]);
+
+	aproto = sdp_list_append(NULL, apseq);
+	sdp_set_access_protos(record, aproto);
+
+	if (name)
+		sdp_set_info_attr(record, name, "BlueZ for Android", NULL);
+
+	sdp_data_free(psm);
+	sdp_data_free(sh);
+	sdp_data_free(eh);
+	sdp_list_free(proto[0], NULL);
+	sdp_list_free(proto[1], NULL);
+	sdp_list_free(apseq, NULL);
+	sdp_list_free(aproto, NULL);
+
+	return record;
+}
+
+static uint32_t add_sdp_record(const bt_uuid_t *uuid, uint16_t start,
+						uint16_t end, const char *name)
+{
+	sdp_record_t *rec;
+	uuid_t u, u32;
+
+	switch (uuid->type) {
+	case BT_UUID16:
+		sdp_uuid16_create(&u, uuid->value.u16);
+		break;
+	case BT_UUID32:
+		sdp_uuid32_create(&u32, uuid->value.u32);
+		sdp_uuid32_to_uuid128(&u, &u32);
+		break;
+	case BT_UUID128:
+		sdp_uuid128_create(&u, &uuid->value.u128);
+		break;
+	default:
+		return 0;
+	}
+
+	rec = get_sdp_record(&u, start, end, name);
+	if (!rec)
+		return 0;
+
+	if (bt_adapter_add_record(rec, 0) < 0) {
+		error("gatt: Failed to register SDP record");
+		sdp_record_free(rec);
+		return 0;
+	}
+
+	return rec->handle;
+}
+
+static bool match_service_sdp(const void *data, const void *user_data)
+{
+	const struct service_sdp *s = data;
+
+	return s->service_handle == PTR_TO_INT(user_data);
+}
+
+static struct service_sdp *new_service_sdp_record(int32_t service_handle)
+{
+	bt_uuid_t uuid;
+	struct service_sdp *s;
+	uint16_t end_handle;
+
+	end_handle = gatt_db_get_end_handle(gatt_db, service_handle);
+	if (!end_handle)
+		return NULL;
+
+	if (!gatt_db_get_service_uuid(gatt_db, service_handle, &uuid))
+		return NULL;
+
+	s = new0(struct service_sdp, 1);
+	if (!s)
+		return NULL;
+
+	s->service_handle = service_handle;
+	s->sdp_handle = add_sdp_record(&uuid, service_handle, end_handle, NULL);
+	if (!s->sdp_handle) {
+		free(s);
+		return NULL;
+	}
+
+	return s;
+}
+
+static void free_service_sdp_record(void *data)
+{
+	struct service_sdp *s = data;
+
+	if (!s)
+		return;
+
+	bt_adapter_remove_record(s->sdp_handle);
+	free(s);
+}
+
+static bool add_service_sdp_record(int32_t service_handle)
+{
+	struct service_sdp *s;
+
+	s = queue_find(services_sdp, match_service_sdp,
+						INT_TO_PTR(service_handle));
+	if (s)
+		return true;
+
+	s = new_service_sdp_record(service_handle);
+	if (!s)
+		return false;
+
+	if (!queue_push_tail(services_sdp, s)) {
+		free_service_sdp_record(s);
+		return false;
+	}
+
+	return true;
+}
+
+static void remove_service_sdp_record(int32_t service_handle)
+{
+	struct service_sdp *s;
+
+	s = queue_remove_if(services_sdp, match_service_sdp,
+						INT_TO_PTR(service_handle));
+	if (!s)
+		return;
+
+	free_service_sdp_record(s);
+}
+
 static void handle_server_start_service(const void *buf, uint16_t len)
 {
 	const struct hal_cmd_gatt_server_start_service *cmd = buf;
@@ -4759,10 +5064,26 @@ static void handle_server_start_service(const void *buf, uint16_t len)
 		goto failed;
 	}
 
-	/* TODO: support BR/EDR (cmd->transport) */
+	switch (cmd->transport) {
+	case GATT_SERVER_TRANSPORT_BREDR:
+	case GATT_SERVER_TRANSPORT_LE_BREDR:
+		if (!add_service_sdp_record(cmd->service_handle)) {
+			status = HAL_STATUS_FAILED;
+			goto failed;
+		}
+		break;
+	case GATT_SERVER_TRANSPORT_LE:
+		break;
+	default:
+		status = HAL_STATUS_FAILED;
+		goto failed;
+	}
 
 	if (!gatt_db_service_set_active(gatt_db, cmd->service_handle, true)) {
-		/* we ignore service now */
+		/*
+		 * no need to clean SDP since this can fail only if service
+		 * handle is invalid in which case add_sdp_record() also fails
+		 */
 		status = HAL_STATUS_FAILED;
 		goto failed;
 	}
@@ -4801,10 +5122,14 @@ static void handle_server_stop_service(const void *buf, uint16_t len)
 		goto failed;
 	}
 
-	if (!gatt_db_service_set_active(gatt_db, cmd->service_handle, false))
+	if (!gatt_db_service_set_active(gatt_db, cmd->service_handle, false)) {
 		status = HAL_STATUS_FAILED;
-	else
-		status = HAL_STATUS_SUCCESS;
+		goto failed;
+	}
+
+	remove_service_sdp_record(cmd->service_handle);
+
+	status = HAL_STATUS_SUCCESS;
 
 	queue_foreach(gatt_devices, notify_service_change,
 					UINT_TO_PTR(cmd->service_handle));
@@ -4842,6 +5167,8 @@ static void handle_server_delete_service(const void *buf, uint16_t len)
 		status = HAL_STATUS_FAILED;
 		goto failed;
 	}
+
+	remove_service_sdp_record(cmd->service_handle);
 
 	status = HAL_STATUS_SUCCESS;
 
@@ -5447,6 +5774,12 @@ static void write_signed_cmd_request(const uint8_t *cmd, uint16_t cmd_len,
 	uint8_t csrk[16];
 	uint32_t sign_cnt;
 
+	if (get_cid(dev) != ATT_CID) {
+		error("gatt: Remote tries write signed on BR/EDR bearer");
+		connection_cleanup(dev);
+		return;
+	}
+
 	if (get_sec_level(dev) != BT_SECURITY_LOW) {
 		error("gatt: Remote tries write signed on encrypted link");
 		connection_cleanup(dev);
@@ -5785,7 +6118,9 @@ static void connect_confirm(GIOChannel *io, void *user_data)
 
 		dev->bdaddr_type = dst_type;
 	} else {
-		if (dev->state != DEVICE_DISCONNECTED) {
+		if ((dev->state != DEVICE_DISCONNECTED) &&
+					!(dev->state == DEVICE_CONNECT_INIT &&
+					bt_kernel_conn_control())) {
 			char addr[18];
 
 			ba2str(&dst, addr);
@@ -5884,6 +6219,7 @@ done:
 
 static void register_gap_service(void)
 {
+	uint16_t start, end;
 	bt_uuid_t uuid;
 
 	/* GAP UUID */
@@ -5918,6 +6254,15 @@ static void register_gap_service(void)
 							NULL);
 
 	gatt_db_service_set_active(gatt_db, gap_srvc_data.srvc , true);
+
+	/* SDP */
+	bt_uuid16_create(&uuid, 0x1800);
+	start = gap_srvc_data.srvc;
+	end = gatt_db_get_end_handle(gatt_db, gap_srvc_data.srvc);
+	gap_sdp_handle = add_sdp_record(&uuid, start, end,
+						"Generic Access Profile");
+	if (!gap_sdp_handle)
+		error("gatt: Failed to register GAP SDP record");
 }
 
 /* TODO: Get those data from device possible via androig/bluetooth.c */
@@ -5973,7 +6318,7 @@ done:
 static void register_device_info_service(void)
 {
 	bt_uuid_t uuid;
-	uint16_t srvc_handle;
+	uint16_t srvc_handle, end_handle;
 
 	DBG("");
 
@@ -6019,6 +6364,14 @@ static void register_device_info_service(void)
 					(void *) device_info.manufacturer_name);
 
 	gatt_db_service_set_active(gatt_db, srvc_handle, true);
+
+	/* SDP */
+	bt_uuid16_create(&uuid, 0x180a);
+	end_handle = gatt_db_get_end_handle(gatt_db, srvc_handle);
+	dis_sdp_handle = add_sdp_record(&uuid, srvc_handle, end_handle,
+						"Device Information Service");
+	if (!dis_sdp_handle)
+		error("gatt: Failed to register DIS SDP record");
 }
 
 static void gatt_srvc_change_write_cb(uint16_t handle, uint16_t offset,
@@ -6087,8 +6440,8 @@ static void gatt_srvc_change_read_cb(uint16_t handle, uint16_t offset,
 
 static void register_gatt_service(void)
 {
+	uint16_t srvc_handle, end_handle;
 	bt_uuid_t uuid;
-	uint16_t srvc_handle;
 
 	DBG("");
 
@@ -6097,7 +6450,7 @@ static void register_gatt_service(void)
 
 	bt_uuid16_create(&uuid, GATT_CHARAC_SERVICE_CHANGED);
 	service_changed_handle =  gatt_db_add_characteristic(gatt_db,
-					srvc_handle, &uuid, 0,
+					srvc_handle, &uuid, GATT_PERM_NONE,
 					GATT_CHR_PROP_INDICATE, NULL, NULL,
 					NULL);
 
@@ -6108,22 +6461,35 @@ static void register_gatt_service(void)
 					gatt_srvc_change_write_cb, NULL);
 
 	gatt_db_service_set_active(gatt_db, srvc_handle, true);
+
+	/* SDP */
+	bt_uuid16_create(&uuid, 0x1801);
+	end_handle = gatt_db_get_end_handle(gatt_db, srvc_handle);
+	gatt_sdp_handle = add_sdp_record(&uuid, srvc_handle, end_handle,
+						"Generic Attribute Profile");
+
+	if (!gatt_sdp_handle)
+		error("gatt: Failed to register GATT SDP record");
 }
 
-static bool start_listening_io(void)
+static bool start_listening(void)
 {
-	GError *gerr = NULL;
+	/* BR/EDR socket */
+	bredr_io = bt_io_listen(NULL, connect_confirm, NULL, NULL, NULL,
+					BT_IO_OPT_SOURCE_TYPE, BDADDR_BREDR,
+					BT_IO_OPT_PSM, ATT_PSM,
+					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
+					BT_IO_OPT_INVALID);
 
-	/* For now only listen on BLE */
-	listening_io = bt_io_listen(NULL, connect_confirm,
-					&listening_io, NULL, &gerr,
+	/* LE socket */
+	le_io = bt_io_listen(NULL, connect_confirm, NULL, NULL, NULL,
 					BT_IO_OPT_SOURCE_TYPE, BDADDR_LE_PUBLIC,
 					BT_IO_OPT_CID, ATT_CID,
 					BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_LOW,
 					BT_IO_OPT_INVALID);
-	if (!listening_io) {
-		error("gatt: Failed to start listening IO (%s)", gerr->message);
-		g_error_free(gerr);
+
+	if (!le_io && !bredr_io) {
+		error("gatt: Failed to start listening IO");
 		return false;
 	}
 
@@ -6134,59 +6500,31 @@ bool bt_gatt_register(struct ipc *ipc, const bdaddr_t *addr)
 {
 	DBG("");
 
-	if (!start_listening_io())
+	if (!start_listening())
 		return false;
-
-	if (!bt_le_register(le_device_found_handler)) {
-		error("gatt: bt_le_register failed");
-
-		g_io_channel_unref(listening_io);
-		listening_io = NULL;
-
-		return false;
-	}
 
 	crypto = bt_crypto_new();
 	if (!crypto) {
 		error("gatt: Failed to setup crypto");
-
-		g_io_channel_unref(listening_io);
-		listening_io = NULL;
-
-		return false;
+		goto failed;
 	}
 
 	gatt_devices = queue_new();
 	gatt_apps = queue_new();
 	app_connections = queue_new();
 	listen_apps = queue_new();
+	services_sdp = queue_new();
 	gatt_db = gatt_db_new();
 
 	if (!gatt_devices || !gatt_apps || !listen_apps || !app_connections ||
-								!gatt_db) {
+						!services_sdp || !gatt_db) {
 		error("gatt: Failed to allocate memory for queues");
+		goto failed;
+	}
 
-		queue_destroy(gatt_apps, NULL);
-		gatt_apps = NULL;
-
-		queue_destroy(gatt_devices, NULL);
-		gatt_devices = NULL;
-
-		queue_destroy(app_connections, NULL);
-		app_connections = NULL;
-
-		queue_destroy(listen_apps, NULL);
-		listen_apps = NULL;
-
-		gatt_db_destroy(gatt_db);
-		gatt_db = NULL;
-
-		g_io_channel_unref(listening_io);
-		listening_io = NULL;
-
-		bt_crypto_unref(crypto);
-
-		return false;
+	if (!bt_le_register(le_device_found_handler)) {
+		error("gatt: bt_le_register failed");
+		goto failed;
 	}
 
 	bacpy(&adapter_addr, addr);
@@ -6200,7 +6538,44 @@ bool bt_gatt_register(struct ipc *ipc, const bdaddr_t *addr)
 	register_device_info_service();
 	register_gatt_service();
 
+	info("gatt: LE: %s BR/EDR: %s", le_io ? "enabled" : "disabled",
+					bredr_io ? "enabled" : "disabled");
+
 	return true;
+
+failed:
+	queue_destroy(gatt_apps, NULL);
+	gatt_apps = NULL;
+
+	queue_destroy(gatt_devices, NULL);
+	gatt_devices = NULL;
+
+	queue_destroy(app_connections, NULL);
+	app_connections = NULL;
+
+	queue_destroy(listen_apps, NULL);
+	listen_apps = NULL;
+
+	queue_destroy(services_sdp, NULL);
+	services_sdp = NULL;
+
+	gatt_db_destroy(gatt_db);
+	gatt_db = NULL;
+
+	bt_crypto_unref(crypto);
+	crypto = NULL;
+
+	if (le_io) {
+		g_io_channel_unref(le_io);
+		le_io = NULL;
+	}
+
+	if (bredr_io) {
+		g_io_channel_unref(bredr_io);
+		bredr_io = NULL;
+	}
+
+	return false;
 }
 
 void bt_gatt_unregister(void)
@@ -6219,21 +6594,41 @@ void bt_gatt_unregister(void)
 	queue_destroy(gatt_devices, destroy_device);
 	gatt_devices = NULL;
 
+	queue_destroy(services_sdp, free_service_sdp_record);
+	services_sdp = NULL;
+
 	queue_destroy(listen_apps, NULL);
 	listen_apps = NULL;
 
 	gatt_db_destroy(gatt_db);
 	gatt_db = NULL;
 
-	g_io_channel_unref(listening_io);
-	listening_io = NULL;
+	g_io_channel_unref(le_io);
+	le_io = NULL;
+
+	g_io_channel_unref(bredr_io);
+	bredr_io = NULL;
+
+	if (gap_sdp_handle) {
+		bt_adapter_remove_record(gap_sdp_handle);
+		gap_sdp_handle = 0;
+	}
+
+	if (gatt_sdp_handle) {
+		bt_adapter_remove_record(gatt_sdp_handle);
+		gatt_sdp_handle = 0;
+	}
+
+	if (dis_sdp_handle) {
+		bt_adapter_remove_record(dis_sdp_handle);
+		dis_sdp_handle = 0;
+	}
 
 	bt_crypto_unref(crypto);
 	crypto = NULL;
 
 	bt_le_unregister();
 }
-
 
 unsigned int bt_gatt_register_app(const char *uuid, gatt_type_t type,
 							gatt_conn_cb_t func)

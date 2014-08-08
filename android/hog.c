@@ -105,6 +105,8 @@ struct report {
 	uint16_t		ccc_handle;
 	guint			notifyid;
 	struct gatt_char	*decl;
+	uint16_t		len;
+	uint8_t			*value;
 };
 
 static void report_value_cb(const guint8 *pdu, guint16 len, gpointer user_data)
@@ -290,8 +292,18 @@ static void discover_report(GAttrib *attrib, uint16_t start, uint16_t end,
 static void report_read_cb(guint8 status, const guint8 *pdu, guint16 len,
 							gpointer user_data)
 {
-	if (status != 0)
+	struct report *report = user_data;
+
+	if (status != 0) {
 		error("Error reading Report value: %s", att_ecode2str(status));
+		return;
+	}
+
+	if (report->value)
+		g_free(report->value);
+
+	report->value = g_memdup(pdu, len);
+	report->len = len;
 }
 
 static struct report *report_new(struct bt_hog *hog, struct gatt_char *chr)
@@ -404,16 +416,7 @@ static void forward_report(struct uhid_event *ev, void *user_data)
 		size = ev->u.output.size;
 	}
 
-	switch (ev->type) {
-	case UHID_OUTPUT:
-		type = HOG_REPORT_TYPE_OUTPUT;
-		break;
-	case UHID_FEATURE:
-		type = HOG_REPORT_TYPE_FEATURE;
-		break;
-	default:
-		return;
-	}
+	type = HOG_REPORT_TYPE_OUTPUT;
 
 	l = g_slist_find_custom(hog->reports, GUINT_TO_POINTER(type),
 							report_type_cmp);
@@ -434,6 +437,42 @@ static void forward_report(struct uhid_event *ev, void *user_data)
 	else if (report->decl->properties & GATT_CHR_PROP_WRITE_WITHOUT_RESP)
 		gatt_write_cmd(hog->attrib, report->decl->value_handle,
 						data, size, NULL, NULL);
+}
+
+static void get_report(struct uhid_event *ev, void *user_data)
+{
+	struct bt_hog *hog = user_data;
+	struct report *report;
+	GSList *l;
+	struct uhid_event rsp;
+	int err;
+
+	memset(&rsp, 0, sizeof(rsp));
+	rsp.type = UHID_FEATURE_ANSWER;
+	rsp.u.feature_answer.id = ev->u.feature.id;
+
+	l = g_slist_find_custom(hog->reports,
+				GUINT_TO_POINTER(ev->u.feature.rtype),
+				report_type_cmp);
+	if (!l) {
+		rsp.u.feature_answer.err = ENOTSUP;
+		goto done;
+	}
+
+	report = l->data;
+
+	if (!report->value) {
+		rsp.u.feature_answer.err = EIO;
+		goto done;
+	}
+
+	rsp.u.feature_answer.size = report->len;
+	memcpy(rsp.u.feature_answer.data, report->value, report->len);
+
+done:
+	err = bt_uhid_send(hog->uhid, &rsp);
+	if (err < 0)
+		error("bt_uhid_send: %s", strerror(-err));
 }
 
 static bool get_descriptor_item_info(uint8_t *buf, ssize_t blen, ssize_t *len,
@@ -573,7 +612,7 @@ static void report_map_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
 	}
 
 	bt_uhid_register(hog->uhid, UHID_OUTPUT, forward_report, hog);
-	bt_uhid_register(hog->uhid, UHID_FEATURE, forward_report, hog);
+	bt_uhid_register(hog->uhid, UHID_FEATURE, get_report, hog);
 }
 
 static void info_read_cb(guint8 status, const guint8 *pdu, guint16 plen,
@@ -700,6 +739,7 @@ static void report_free(void *data)
 {
 	struct report *report = data;
 
+	g_free(report->value);
 	g_free(report->decl);
 	g_free(report);
 }
