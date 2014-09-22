@@ -38,9 +38,10 @@
 #include "lib/bluetooth.h"
 #include "lib/sdp.h"
 #include "lib/mgmt.h"
+#include "lib/uuid.h"
 #include "src/shared/util.h"
 #include "src/shared/mgmt.h"
-#include "src/uuid-helper.h"
+#include "src/shared/queue.h"
 #include "src/eir.h"
 #include "lib/sdp.h"
 #include "lib/sdp_lib.h"
@@ -140,6 +141,8 @@ struct device {
 	bool le_paired;
 	bool le_bonded;
 
+	bool in_white_list;
+
 	char *name;
 	char *friendly_name;
 
@@ -222,6 +225,8 @@ static GSList *browse_reqs;
 static struct ipc *hal_ipc = NULL;
 
 static bool kernel_conn_control = false;
+
+static struct queue *unpaired_cb_list = NULL;
 
 static void get_device_android_addr(struct device *dev, uint8_t *addr)
 {
@@ -874,6 +879,28 @@ static uint8_t device_bond_state(struct device *dev)
 	return HAL_BOND_STATE_NONE;
 }
 
+static void update_bond_state(struct device *dev, uint8_t status,
+					uint8_t old_bond, uint8_t new_bond)
+{
+	if (old_bond == new_bond)
+		return;
+
+	/*
+	 * When internal bond state changes from bond to non-bond or other way,
+	 * BfA needs to send bonding state to Android in the middle. Otherwise
+	 * Android will not handle it correctly
+	 */
+	if ((old_bond == HAL_BOND_STATE_NONE &&
+				new_bond == HAL_BOND_STATE_BONDED) ||
+				(old_bond == HAL_BOND_STATE_BONDED &&
+				new_bond == HAL_BOND_STATE_NONE))
+		send_bond_state_change(dev, HAL_STATUS_SUCCESS,
+						HAL_BOND_STATE_BONDING);
+
+	send_bond_state_change(dev, status, new_bond);
+
+}
+
 static void update_device_state(struct device *dev, uint8_t addr_type,
 				uint8_t status, bool pairing, bool paired,
 				bool bonded)
@@ -889,8 +916,7 @@ static void update_device_state(struct device *dev, uint8_t addr_type,
 
 	new_bond = device_bond_state(dev);
 
-	if (old_bond != new_bond)
-		send_bond_state_change(dev, status, new_bond);
+	update_bond_state(dev, status, old_bond, new_bond);
 }
 
 static void send_device_property(struct device *dev, uint8_t type,
@@ -1068,6 +1094,139 @@ static uint8_t browse_remote_sdp(const bdaddr_t *addr)
 	return HAL_STATUS_SUCCESS;
 }
 
+static void send_remote_sdp_rec_notify(bt_uuid_t *uuid, int channel,
+					char *name, uint8_t name_len,
+					uint8_t status, bdaddr_t *bdaddr)
+{
+	struct hal_prop_device_service_rec *prop;
+	uint8_t buf[BASELEN_REMOTE_DEV_PROP + name_len + sizeof(*prop)];
+	struct hal_ev_remote_device_props *ev = (void *) buf;
+	size_t prop_len = sizeof(*prop) + name_len;
+
+	memset(buf, 0, sizeof(buf));
+
+	if (uuid && status == HAL_STATUS_SUCCESS) {
+		prop = (void *) &ev->props[0].val;
+		prop->name_len = name_len;
+		prop->channel = (uint16_t)channel;
+		memcpy(prop->name, name, name_len);
+		memcpy(prop->uuid, &uuid->value.u128, sizeof(prop->uuid));
+	}
+
+	ev->num_props = 1;
+	ev->status = status;
+	ev->props[0].len = prop_len;
+	bdaddr2android(bdaddr, ev->bdaddr);
+	ev->props[0].type = HAL_PROP_DEVICE_SERVICE_REC;
+
+	ipc_send_notif(hal_ipc, HAL_SERVICE_ID_BLUETOOTH,
+						HAL_EV_REMOTE_DEVICE_PROPS,
+						sizeof(buf), buf);
+}
+
+static void find_remote_sdp_rec_cb(sdp_list_t *recs, int err,
+							gpointer user_data)
+{
+	bdaddr_t *addr = user_data;
+	uint8_t name_len;
+	uint8_t status;
+	char name_buf[256];
+	int channel;
+	bt_uuid_t uuid;
+	uuid_t uuid128_sdp;
+	sdp_list_t *protos;
+	sdp_record_t *sdp_rec;
+
+	if (err < 0) {
+		error("error while search remote sdp records");
+		status = HAL_STATUS_FAILED;
+		send_remote_sdp_rec_notify(NULL, 0, NULL, 0, status, addr);
+		goto done;
+	}
+
+	if (!recs) {
+		info("No service records found on remote");
+		status = HAL_STATUS_SUCCESS;
+		send_remote_sdp_rec_notify(NULL, 0, NULL, 0, status, addr);
+		goto done;
+	}
+
+	for ( ; recs; recs = recs->next) {
+		sdp_rec = recs->data;
+
+		switch (sdp_rec->svclass.type) {
+		case SDP_UUID16:
+			sdp_uuid16_to_uuid128(&uuid128_sdp,
+							&sdp_rec->svclass);
+			break;
+		case SDP_UUID32:
+			sdp_uuid32_to_uuid128(&uuid128_sdp,
+							&sdp_rec->svclass);
+			break;
+		case SDP_UUID128:
+			break;
+		default:
+			error("wrong sdp uuid type");
+			goto done;
+		}
+
+		if (!sdp_get_access_protos(sdp_rec, &protos)) {
+			channel = sdp_get_proto_port(protos, RFCOMM_UUID);
+
+			sdp_list_foreach(protos,
+						(sdp_list_func_t) sdp_list_free,
+						NULL);
+			sdp_list_free(protos, NULL);
+		} else
+			channel = -1;
+
+		if (channel < 0) {
+			error("can't get channel for sdp record");
+			channel = 0;
+		}
+
+		if (!sdp_get_service_name(sdp_rec, name_buf, sizeof(name_buf)))
+			name_len = strlen(name_buf);
+		else
+			name_len = 0;
+
+		uuid.type = BT_UUID128;
+		memcpy(&uuid.value.u128, uuid128_sdp.value.uuid128.data,
+						sizeof(uuid.value.u128));
+		status = HAL_STATUS_SUCCESS;
+
+		send_remote_sdp_rec_notify(&uuid, channel, name_buf, name_len,
+								status, addr);
+	}
+
+done:
+	g_free(addr);
+}
+
+static uint8_t find_remote_sdp_rec(const bdaddr_t *addr,
+						const uint8_t *find_uuid)
+{
+	bdaddr_t *bdaddr;
+	uuid_t uuid;
+
+	/* from android we always get full 128bit length uuid */
+	sdp_uuid128_create(&uuid, find_uuid);
+
+	bdaddr = g_new(bdaddr_t, 1);
+	if (!bdaddr)
+		return HAL_STATUS_NOMEM;
+
+	memcpy(bdaddr, addr, sizeof(*bdaddr));
+
+	if (bt_search_service(&adapter.bdaddr, addr, &uuid,
+				find_remote_sdp_rec_cb, bdaddr, NULL, 0) < 0) {
+		g_free(bdaddr);
+		return HAL_STATUS_FAILED;
+	}
+
+	return HAL_STATUS_SUCCESS;
+}
+
 static void new_link_key_callback(uint16_t index, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -1092,7 +1251,7 @@ static void new_link_key_callback(uint16_t index, uint16_t length,
 		return;
 	}
 
-	dev = find_device(&ev->key.addr.bdaddr);
+	dev = get_device(&ev->key.addr.bdaddr, ev->key.addr.type);
 	if (!dev)
 		return;
 
@@ -1187,7 +1346,7 @@ static void user_confirm_request_callback(uint16_t index, uint16_t length,
 	ba2str(&ev->addr.bdaddr, dst);
 	DBG("%s confirm_hint %u", dst, ev->confirm_hint);
 
-	dev = find_device(&ev->addr.bdaddr);
+	dev = get_device(&ev->addr.bdaddr, ev->addr.type);
 	if (!dev)
 		return;
 
@@ -1215,7 +1374,7 @@ static void user_passkey_request_callback(uint16_t index, uint16_t length,
 	ba2str(&ev->addr.bdaddr, dst);
 	DBG("%s", dst);
 
-	dev = find_device(&ev->addr.bdaddr);
+	dev = get_device(&ev->addr.bdaddr, ev->addr.type);
 	if (!dev)
 		return;
 
@@ -1513,14 +1672,21 @@ bool bt_auto_connect_add(const bdaddr_t *addr)
 		return false;
 	}
 
+	if (dev->in_white_list) {
+		DBG("Device already in white list");
+		return true;
+	}
+
 	memset(&cp, 0, sizeof(cp));
 	bacpy(&cp.addr.bdaddr, addr);
 	cp.addr.type = dev->bdaddr_type;
 	cp.action = 0x02;
 
 	if (mgmt_send(mgmt_if, MGMT_OP_ADD_DEVICE, adapter.index, sizeof(cp),
-						&cp, NULL, NULL, NULL) > 0)
+						&cp, NULL, NULL, NULL) > 0) {
+		dev->in_white_list = true;
 		return true;
+	}
 
 	error("Failed to add device");
 
@@ -1544,15 +1710,40 @@ void bt_auto_connect_remove(const bdaddr_t *addr)
 		return;
 	}
 
+	if (!dev->in_white_list) {
+		DBG("Device already removed from white list");
+		return;
+	}
+
 	memset(&cp, 0, sizeof(cp));
 	bacpy(&cp.addr.bdaddr, addr);
 	cp.addr.type = dev->bdaddr_type;
 
 	if (mgmt_send(mgmt_if, MGMT_OP_REMOVE_DEVICE, adapter.index,
-					sizeof(cp), &cp, NULL, NULL, NULL) > 0)
+				sizeof(cp), &cp, NULL, NULL, NULL) > 0) {
+		dev->in_white_list = false;
 		return;
+	}
 
 	error("Failed to remove device");
+}
+
+static bool match_by_value(const void *data, const void *user_data)
+{
+	return data == user_data;
+}
+
+bool bt_unpaired_register(bt_unpaired_device_cb cb)
+{
+	if (queue_find(unpaired_cb_list, match_by_value, cb))
+		return false;
+
+	return queue_push_head(unpaired_cb_list, cb);
+}
+
+void bt_unpaired_unregister(bt_unpaired_device_cb cb)
+{
+	queue_remove(unpaired_cb_list, cb);
 }
 
 static bool rssi_above_threshold(int old, int new)
@@ -1568,7 +1759,7 @@ static void update_new_device(struct device *dev, int8_t rssi,
 	struct hal_ev_device_found *ev = (void *) buf;
 	uint8_t android_bdaddr[6];
 	uint8_t android_type;
-	int size;
+	size_t size;
 
 	memset(buf, 0, sizeof(buf));
 
@@ -1635,7 +1826,7 @@ static void update_device(struct device *dev, int8_t rssi,
 	uint8_t buf[IPC_MTU];
 	struct hal_ev_remote_device_props *ev = (void *) buf;
 	uint8_t old_type, new_type;
-	int size;
+	size_t size;
 
 	memset(buf, 0, sizeof(buf));
 
@@ -1697,7 +1888,8 @@ static void update_device(struct device *dev, int8_t rssi,
 					HAL_EV_REMOTE_DEVICE_PROPS, size, buf);
 }
 
-static bool is_new_device(const struct device *dev, unsigned int flags)
+static bool is_new_device(const struct device *dev, unsigned int flags,
+							uint8_t bdaddr_type)
 {
 	if (dev->found)
 		return false;
@@ -1705,7 +1897,7 @@ static bool is_new_device(const struct device *dev, unsigned int flags)
 	if (dev->bredr_paired || dev->le_paired)
 		return false;
 
-	if (dev->bdaddr_type != BDADDR_BREDR &&
+	if (bdaddr_type != BDADDR_BREDR &&
 				!(flags & (EIR_LIM_DISC | EIR_GEN_DISC)))
 		return false;
 
@@ -1734,7 +1926,7 @@ static void update_found_device(const bdaddr_t *bdaddr, uint8_t bdaddr_type,
 	 * Device found event needs to be send also for known device if this is
 	 * new discovery session. Otherwise framework will ignore it.
 	 */
-	if (is_new_device(dev, eir.flags))
+	if (is_new_device(dev, eir.flags, bdaddr_type))
 		update_new_device(dev, rssi, &eir);
 	else
 		update_device(dev, rssi, &eir, bdaddr_type);
@@ -1859,6 +2051,19 @@ static void mgmt_device_connected_event(uint16_t index, uint16_t length,
 			HAL_EV_ACL_STATE_CHANGED, sizeof(hal_ev), &hal_ev);
 }
 
+static bool device_is_paired(struct device *dev, uint8_t addr_type)
+{
+	if (addr_type == BDADDR_BREDR)
+		return dev->bredr_paired;
+
+	return dev->le_paired;
+}
+
+static bool device_is_bonded(struct device *dev)
+{
+	return dev->bredr_bonded || dev->le_bonded;
+}
+
 static void mgmt_device_disconnected_event(uint16_t index, uint16_t length,
 							const void *param,
 							void *user_data)
@@ -1866,6 +2071,7 @@ static void mgmt_device_disconnected_event(uint16_t index, uint16_t length,
 	const struct mgmt_ev_device_disconnected *ev = param;
 	struct hal_ev_acl_state_changed hal_ev;
 	struct device *dev;
+	uint8_t type = ev->addr.type;
 
 	if (length < sizeof(*ev)) {
 		error("Too short device disconnected event (%u bytes)", length);
@@ -1882,6 +2088,10 @@ static void mgmt_device_disconnected_event(uint16_t index, uint16_t length,
 
 	ipc_send_notif(hal_ipc, HAL_SERVICE_ID_BLUETOOTH,
 			HAL_EV_ACL_STATE_CHANGED, sizeof(hal_ev), &hal_ev);
+
+	if (device_is_paired(dev, type) && !device_is_bonded(dev))
+		update_device_state(dev, type, HAL_STATUS_SUCCESS, false,
+								false, false);
 }
 
 static uint8_t status_mgmt2hal(uint8_t mgmt)
@@ -1981,6 +2191,9 @@ static void mgmt_device_unpaired_event(uint16_t index, uint16_t length,
 
 	update_device_state(dev, ev->addr.type, HAL_STATUS_SUCCESS, false,
 								false, false);
+
+	/* Unpaired device is removed from the white list */
+	dev->in_white_list = false;
 }
 
 static void store_ltk(const bdaddr_t *dst, uint8_t bdaddr_type, bool master,
@@ -2121,7 +2334,7 @@ static void new_csrk_callback(uint16_t index, uint16_t length,
 	}
 
 	ba2str(&ev->key.addr.bdaddr, dst);
-	dev = find_device(&ev->key.addr.bdaddr);
+	dev = get_device(&ev->key.addr.bdaddr, ev->key.addr.type);
 	if (!dev)
 		return;
 
@@ -2196,7 +2409,7 @@ static void new_irk_callback(uint16_t index, uint16_t length,
 	DBG("new IRK for %s, RPA %s", dst, rpa);
 
 	if (!bacmp(&ev->rpa, BDADDR_ANY)) {
-		dev = find_device(&addr->bdaddr);
+		dev = get_device(&addr->bdaddr, addr->type);
 		if (!dev)
 			return;
 	} else {
@@ -2432,8 +2645,8 @@ static uint8_t get_adapter_uuids(void)
 {
 	struct hal_ev_adapter_props_changed *ev;
 	GSList *list = adapter.uuids;
-	unsigned int uuid_count = g_slist_length(list);
-	int len = uuid_count * sizeof(uint128_t);
+	size_t uuid_count = g_slist_length(list);
+	size_t len = uuid_count * sizeof(uint128_t);
 	uint8_t buf[BASELEN_PROP_CHANGED + len];
 	uint8_t *p;
 
@@ -2465,8 +2678,8 @@ static void remove_uuid_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
 	if (status != MGMT_STATUS_SUCCESS) {
-		error("Failed to remove UUID: %s (0x%02x)",
-						mgmt_errstr(status), status);
+		error("Failed to remove UUID: %s (0x%02x)", mgmt_errstr(status),
+									status);
 		return;
 	}
 
@@ -2491,8 +2704,8 @@ static void add_uuid_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
 	if (status != MGMT_STATUS_SUCCESS) {
-		error("Failed to add UUID: %s (0x%02x)",
-						mgmt_errstr(status), status);
+		error("Failed to add UUID: %s (0x%02x)", mgmt_errstr(status),
+									status);
 		return;
 	}
 
@@ -2642,8 +2855,8 @@ static void set_adapter_name_complete(uint8_t status, uint16_t length,
 	const struct mgmt_cp_set_local_name *rp = param;
 
 	if (status != MGMT_STATUS_SUCCESS) {
-		error("Failed to set name: %s (0x%02x)",
-						mgmt_errstr(status), status);
+		error("Failed to set name: %s (0x%02x)", mgmt_errstr(status),
+									status);
 		return;
 	}
 
@@ -2701,8 +2914,8 @@ static void clear_uuids(void)
 
 	memset(&cp, 0, sizeof(cp));
 
-	mgmt_send(mgmt_if, MGMT_OP_REMOVE_UUID, adapter.index,
-					sizeof(cp), &cp, NULL, NULL, NULL);
+	mgmt_send(mgmt_if, MGMT_OP_REMOVE_UUID, adapter.index, sizeof(cp),
+							&cp, NULL, NULL, NULL);
 }
 
 static struct device *create_device_from_info(GKeyFile *key_file,
@@ -3051,8 +3264,8 @@ static void set_adapter_class(void)
 	cp.major = ADAPTER_MAJOR_CLASS & 0x1f;
 	cp.minor = ADAPTER_MINOR_CLASS << 2;
 
-	if (mgmt_send(mgmt_if, MGMT_OP_SET_DEV_CLASS, adapter.index,
-					sizeof(cp), &cp, NULL, NULL, NULL) > 0)
+	if (mgmt_send(mgmt_if, MGMT_OP_SET_DEV_CLASS, adapter.index, sizeof(cp),
+						&cp, NULL, NULL, NULL) > 0)
 		return;
 
 	error("Failed to set class of device");
@@ -3148,10 +3361,8 @@ static void clear_auto_connect_list(void)
 
 	memset(&cp, 0, sizeof(cp));
 
-	if (mgmt_send(mgmt_if, MGMT_OP_REMOVE_DEVICE, adapter.index,
-					sizeof(cp), &cp,
-					clear_auto_connect_list_complete,
-					NULL, NULL) > 0)
+	if (mgmt_send(mgmt_if, MGMT_OP_REMOVE_DEVICE, adapter.index, sizeof(cp),
+			&cp, clear_auto_connect_list_complete, NULL, NULL) > 0)
 		return;
 
 	error("Could not clear auto connect list");
@@ -3290,8 +3501,8 @@ static void read_index_list_complete(uint8_t status, uint16_t length,
 	DBG("");
 
 	if (status) {
-		error("%s: Failed to read index list: %s (0x%02x)",
-					__func__, mgmt_errstr(status), status);
+		error("%s: Failed to read index list: %s (0x%02x)", __func__,
+						mgmt_errstr(status), status);
 		goto failed;
 	}
 
@@ -3635,7 +3846,7 @@ static void get_adapter_properties(void)
 	uint128_t uuids[g_slist_length(adapter.uuids)];
 	uint8_t android_bdaddr[6];
 	uint8_t type, mode;
-	int size, i;
+	size_t size, i;
 	GSList *l;
 
 	size = sizeof(*ev);
@@ -4065,31 +4276,34 @@ static void pair_device_complete(uint8_t status, uint16_t length,
 
 	DBG("status %u", status);
 
-	/*
-	 * On success bond state change will be send when new link key or LTK
-	 * event is received
-	 */
-	if (status == MGMT_STATUS_SUCCESS)
-		return;
-
 	dev = find_device(&rp->addr.bdaddr);
 	if (!dev)
 		return;
 
+	/*
+	 * Update pairing and paired status. Bonded status will be updated once
+	 * any link key come
+	 */
 	update_device_state(dev, rp->addr.type, status_mgmt2hal(status), false,
-								false, false);
+								!status, false);
 }
 
 static uint8_t select_device_bearer(struct device *dev)
 {
+	uint8_t res;
+
 	if (dev->bredr && dev->le) {
 		if (dev->le_seen > dev->bredr_seen)
-			return dev->bdaddr_type;
-
-		return BDADDR_BREDR;
+			res = dev->bdaddr_type;
+		else
+			res = BDADDR_BREDR;
+	} else {
+		res = dev->bredr ? BDADDR_BREDR : dev->bdaddr_type;
 	}
 
-	return dev->bredr ? BDADDR_BREDR : dev->bdaddr_type;
+	DBG("Selected bearer %d", res);
+
+	return res;
 }
 
 uint8_t bt_device_last_seen_bearer(const bdaddr_t *bdaddr)
@@ -4101,14 +4315,6 @@ uint8_t bt_device_last_seen_bearer(const bdaddr_t *bdaddr)
 		return BDADDR_BREDR;
 
 	return select_device_bearer(dev);
-}
-
-static bool device_is_paired(struct device *dev, uint8_t addr_type)
-{
-	if (addr_type == BDADDR_BREDR)
-		return dev->bredr_paired;
-
-	return dev->le_paired;
 }
 
 static void handle_create_bond_cmd(const void *buf, uint16_t len)
@@ -4161,9 +4367,8 @@ static void handle_cancel_bond_cmd(const void *buf, uint16_t len)
 	cp.type = select_device_bearer(dev);
 	bacpy(&cp.bdaddr, &dev->bdaddr);
 
-	if (mgmt_reply(mgmt_if, MGMT_OP_CANCEL_PAIR_DEVICE,
-					adapter.index, sizeof(cp), &cp,
-					NULL, NULL, NULL) == 0) {
+	if (mgmt_reply(mgmt_if, MGMT_OP_CANCEL_PAIR_DEVICE, adapter.index,
+				sizeof(cp), &cp, NULL, NULL, NULL) == 0) {
 		status = HAL_STATUS_FAILED;
 		goto failed;
 	}
@@ -4173,6 +4378,14 @@ static void handle_cancel_bond_cmd(const void *buf, uint16_t len)
 failed:
 	ipc_send_rsp(hal_ipc, HAL_SERVICE_ID_BLUETOOTH, HAL_OP_CANCEL_BOND,
 									status);
+}
+
+static void send_unpaired_notification(void *data, void *user_data)
+{
+	bt_unpaired_device_cb cb = data;
+	struct mgmt_addr_info *addr = user_data;
+
+	cb(&addr->bdaddr, addr->type);
 }
 
 static void unpair_device_complete(uint8_t status, uint16_t length,
@@ -4192,6 +4405,10 @@ static void unpair_device_complete(uint8_t status, uint16_t length,
 
 	update_device_state(dev, rp->addr.type, HAL_STATUS_SUCCESS, false,
 								false, false);
+
+	/* Cast rp->addr to (void *) since queue_foreach don't take const */
+	queue_foreach(unpaired_cb_list, send_unpaired_notification,
+							(void *)&rp->addr);
 }
 
 static void handle_remove_bond_cmd(const void *buf, uint16_t len)
@@ -4366,11 +4583,13 @@ static void handle_ssp_reply_cmd(const void *buf, uint16_t len)
 	switch (cmd->ssp_variant) {
 	case HAL_SSP_VARIANT_CONFIRM:
 	case HAL_SSP_VARIANT_CONSENT:
-		status = user_confirm_reply(&dev->bdaddr, dev->bdaddr_type,
-								cmd->accept);
+		status = user_confirm_reply(&dev->bdaddr,
+						select_device_bearer(dev),
+						cmd->accept);
 		break;
 	case HAL_SSP_VARIANT_ENTRY:
-		status = user_passkey_reply(&dev->bdaddr, dev->bdaddr_type,
+		status = user_passkey_reply(&dev->bdaddr,
+						select_device_bearer(dev),
 						cmd->accept, cmd->passkey);
 		break;
 	case HAL_SSP_VARIANT_NOTIF:
@@ -4408,8 +4627,8 @@ static uint8_t get_device_uuids(struct device *dev)
 
 static uint8_t get_device_class(struct device *dev)
 {
-	send_device_property(dev, HAL_PROP_DEVICE_CLASS,
-					sizeof(dev->class), &dev->class);
+	send_device_property(dev, HAL_PROP_DEVICE_CLASS, sizeof(dev->class),
+								&dev->class);
 
 	return HAL_STATUS_SUCCESS;
 }
@@ -4448,8 +4667,8 @@ static uint8_t get_device_rssi(struct device *dev)
 	if (!dev->rssi)
 		return HAL_STATUS_FAILED;
 
-	send_device_property(dev, HAL_PROP_DEVICE_RSSI,
-						sizeof(dev->rssi), &dev->rssi);
+	send_device_property(dev, HAL_PROP_DEVICE_RSSI, sizeof(dev->rssi),
+								&dev->rssi);
 
 	return HAL_STATUS_SUCCESS;
 }
@@ -4469,8 +4688,8 @@ static uint8_t get_device_timestamp(struct device *dev)
 
 	timestamp = device_timestamp(dev);
 
-	send_device_property(dev, HAL_PROP_DEVICE_TIMESTAMP,
-						sizeof(timestamp), &timestamp);
+	send_device_property(dev, HAL_PROP_DEVICE_TIMESTAMP, sizeof(timestamp),
+								&timestamp);
 
 	return HAL_STATUS_SUCCESS;
 }
@@ -4482,7 +4701,7 @@ static void get_remote_device_props(struct device *dev)
 	uint128_t uuids[g_slist_length(dev->uuids)];
 	uint8_t android_type;
 	uint32_t timestamp;
-	int size, i;
+	size_t size, i;
 	GSList *l;
 
 	memset(buf, 0, sizeof(buf));
@@ -4747,12 +4966,16 @@ failed:
 
 static void handle_get_remote_service_rec_cmd(const void *buf, uint16_t len)
 {
-	/* TODO */
+	const struct hal_cmd_get_remote_service_rec *cmd = buf;
+	uint8_t status;
+	bdaddr_t addr;
 
-	error("get_remote_service_record not supported");
+	android2bdaddr(&cmd->bdaddr, &addr);
+
+	status = find_remote_sdp_rec(&addr, cmd->uuid);
 
 	ipc_send_rsp(hal_ipc, HAL_SERVICE_ID_BLUETOOTH,
-			HAL_OP_GET_REMOTE_SERVICE_REC, HAL_STATUS_FAILED);
+					HAL_OP_GET_REMOTE_SERVICE_REC, status);
 }
 
 static void handle_start_discovery_cmd(const void *buf, uint16_t len)
@@ -4970,8 +5193,14 @@ bool bt_bluetooth_register(struct ipc *ipc, uint8_t mode)
 
 	DBG("mode 0x%x", mode);
 
+	unpaired_cb_list = queue_new();
+	if (!unpaired_cb_list) {
+		error("Can not allocate queue for unpaired callbacks");
+		return false;
+	}
+
 	missing_settings = adapter.current_settings ^
-					adapter.supported_settings;
+						adapter.supported_settings;
 
 	switch (mode) {
 	case HAL_MODE_DEFAULT:
@@ -4985,7 +5214,7 @@ bool bt_bluetooth_register(struct ipc *ipc, uint8_t mode)
 		/* Fail if controller does not support LE */
 		if (!(adapter.supported_settings & MGMT_SETTING_LE)) {
 			error("LE Mode not supported by controller");
-			return false;
+			goto failed;
 		}
 
 		/* If LE it is not yet enabled then enable it */
@@ -5000,7 +5229,7 @@ bool bt_bluetooth_register(struct ipc *ipc, uint8_t mode)
 		/* Fail if controller does not support BR/EDR */
 		if (!(adapter.supported_settings & MGMT_SETTING_BREDR)) {
 			error("BR/EDR Mode not supported");
-			return false;
+			goto failed;
 		}
 
 		/* Enable BR/EDR if it is not enabled */
@@ -5018,7 +5247,7 @@ bool bt_bluetooth_register(struct ipc *ipc, uint8_t mode)
 		break;
 	default:
 		error("Unknown mode 0x%x", mode);
-		return false;
+		goto failed;
 	}
 
 	hal_ipc = ipc;
@@ -5027,6 +5256,10 @@ bool bt_bluetooth_register(struct ipc *ipc, uint8_t mode)
 						G_N_ELEMENTS(cmd_handlers));
 
 	return true;
+
+failed:
+	queue_destroy(unpaired_cb_list, NULL);
+	return false;
 }
 
 void bt_bluetooth_unregister(void)
@@ -5041,4 +5274,7 @@ void bt_bluetooth_unregister(void)
 
 	ipc_unregister(hal_ipc, HAL_SERVICE_ID_CORE);
 	hal_ipc = NULL;
+
+	queue_destroy(unpaired_cb_list, NULL);
+	unpaired_cb_list = NULL;
 }

@@ -1226,7 +1226,7 @@ static bool l2cap_conn_req(struct bthost *bthost, struct btconn *conn,
 
 	cb_data = bthost_find_l2cap_cb_by_psm(bthost, psm);
 	if (cb_data)
-		rsp.dcid = cpu_to_le16(conn->next_cid++);
+		rsp.dcid = rsp.scid;
 	else
 		rsp.result = cpu_to_le16(0x0002); /* PSM Not Supported */
 
@@ -2067,6 +2067,17 @@ void bthost_hci_connect(struct bthost *bthost, const uint8_t *bdaddr,
 		send_command(bthost, BT_HCI_CMD_LE_CREATE_CONN,
 							&cc, sizeof(cc));
 	}
+}
+
+void bthost_hci_disconnect(struct bthost *bthost, uint16_t handle,
+								uint8_t reason)
+{
+	struct bt_hci_cmd_disconnect disc;
+
+	disc.handle = cpu_to_le16(handle);
+	disc.reason = reason;
+
+	send_command(bthost, BT_HCI_CMD_DISCONNECT, &disc, sizeof(disc));
 }
 
 void bthost_write_scan_enable(struct bthost *bthost, uint8_t scan)

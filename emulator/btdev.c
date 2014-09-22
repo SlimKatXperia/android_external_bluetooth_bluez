@@ -1023,6 +1023,7 @@ static void le_conn_complete(struct btdev *btdev,
 
 		btdev->conn = remote;
 		remote->conn = btdev;
+		remote->le_adv_enable = 0;
 
 		cc->status = status;
 		cc->peer_addr_type = btdev->le_scan_own_addr_type;
@@ -1427,7 +1428,7 @@ static void remote_ext_features_complete(struct btdev *btdev, uint16_t handle,
 			break;
 		case 0x01:
 			refc.status = BT_HCI_ERR_SUCCESS;
-			btdev_get_host_features(btdev, refc.features);
+			btdev_get_host_features(btdev->conn, refc.features);
 			break;
 		default:
 			refc.status = BT_HCI_ERR_INVALID_PARAMETERS;

@@ -164,6 +164,8 @@ struct gatt_device {
 	int ref;
 	int conn_cnt;
 
+	struct queue *autoconnect_apps;
+
 	struct queue *pending_requests;
 };
 
@@ -580,6 +582,23 @@ static void device_set_state(struct gatt_device *dev, uint32_t state)
 	dev->state = state;
 }
 
+static bool auto_connect_le(struct gatt_device *dev)
+{
+	/*  For LE devices use auto connect feature if possible */
+	if (bt_kernel_conn_control())
+		return  bt_auto_connect_add(&dev->bdaddr);
+
+	/* Trigger discovery if not already started */
+	if (!scanning) {
+		if (!bt_le_discovery_start()) {
+			error("gatt: Could not start scan");
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static void connection_cleanup(struct gatt_device *device)
 {
 	if (device->watch_id) {
@@ -619,6 +638,13 @@ static void connection_cleanup(struct gatt_device *device)
 		queue_remove_all(device->services, NULL, NULL, destroy_service);
 
 	device_set_state(device, DEVICE_DISCONNECTED);
+
+	if (!queue_isempty(device->autoconnect_apps)) {
+		auto_connect_le(device);
+		device_set_state(device, DEVICE_CONNECT_INIT);
+	} else {
+		bt_auto_connect_remove(&device->bdaddr);
+	}
 }
 
 static void destroy_gatt_app(void *data)
@@ -682,6 +708,9 @@ static void destroy_device(void *data)
 
 	queue_destroy(dev->services, destroy_service);
 	queue_destroy(dev->pending_requests, destroy_pending_request);
+	queue_destroy(dev->autoconnect_apps, NULL);
+
+	bt_auto_connect_remove(&dev->bdaddr);
 
 	free(dev);
 }
@@ -724,6 +753,12 @@ static struct gatt_device *create_device(const bdaddr_t *addr)
 		return NULL;
 	}
 
+	dev->autoconnect_apps = queue_new();
+	if (!dev->autoconnect_apps) {
+		error("gatt: Failed to allocate memory for client");
+		destroy_device(dev);
+		return NULL;
+	}
 
 	dev->pending_requests = queue_new();
 	if (!dev->pending_requests) {
@@ -1337,6 +1372,48 @@ static void send_app_connect_notifications(void *data, void *user_data)
 		send_app_connect_notify(conn, con_data->status);
 }
 
+static struct app_connection *find_conn(const bdaddr_t *addr, int32_t app_id)
+{
+	struct app_connection conn_match;
+	struct gatt_device *dev = NULL;
+	struct gatt_app *app;
+
+	/* Check if app is registered */
+	app = find_app_by_id(app_id);
+	if (!app) {
+		error("gatt: Client id %d not found", app_id);
+		return NULL;
+	}
+
+	/* Check if device is known */
+	dev = find_device_by_addr(addr);
+	if (!dev) {
+		error("gatt: Client id %d not found", app_id);
+		return NULL;
+	}
+
+	conn_match.device = dev;
+	conn_match.app = app;
+
+	return queue_find(app_connections, match_connection_by_device_and_app,
+								&conn_match);
+}
+
+static void create_app_connection(void *data, void *user_data)
+{
+	struct gatt_device *dev = user_data;
+	struct gatt_app *app;
+
+	app = find_app_by_id(PTR_TO_INT(data));
+	if (!app)
+		return;
+
+	DBG("Autoconnect application id=%d", app->id);
+
+	if (!find_conn(&dev->bdaddr, PTR_TO_INT(data)))
+		create_connection(dev, app);
+}
+
 static void connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 {
 	struct gatt_device *dev = user_data;
@@ -1383,8 +1460,6 @@ static void connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 
 	device_set_state(dev, DEVICE_CONNECTED);
 
-	bt_auto_connect_remove(&dev->bdaddr);
-
 	/* Send exchange mtu request as we assume being client and server */
 	/* TODO: Dont exchange mtu if no client apps */
 	send_exchange_mtu_request(dev);
@@ -1408,6 +1483,12 @@ static void connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 	status = GATT_SUCCESS;
 
 reply:
+	/*
+	 * Make sure there are app_connections for all apps interested in auto
+	 * connect to that device
+	 */
+	queue_foreach(dev->autoconnect_apps, create_app_connection, dev);
+
 	if (!dev->conn_cnt) {
 		struct app_connection *conn;
 
@@ -1755,19 +1836,6 @@ static int connect_bredr(struct gatt_device *dev)
 	return 0;
 }
 
-static bool auto_connect(struct gatt_device *dev)
-{
-	bool err;
-
-	err = bt_auto_connect_add(&dev->bdaddr);
-	if (!err)
-		return false;
-
-	device_set_state(dev, DEVICE_CONNECT_INIT);
-
-	return true;
-}
-
 static bool trigger_connection(struct app_connection *connection)
 {
 	bool ret;
@@ -1782,24 +1850,11 @@ static bool trigger_connection(struct app_connection *connection)
 								BDADDR_BREDR)
 			return connect_bredr(connection->device) == 0;
 
-		/*
-		 * For LE devices use auto connect feature if possible
-		 * Note: Connection state is handled inside auto_connect() func
-		 */
-		if (bt_kernel_conn_control())
-			return auto_connect(connection->device);
-
-		/* Trigger discovery if not already started */
-		if (!scanning) {
-			if (!bt_le_discovery_start()) {
-				error("gatt: Could not start scan");
-				ret = false;
-				break;
-			}
-		}
-
-		ret = true;
-		device_set_state(connection->device, DEVICE_CONNECT_INIT);
+		/* For LE use auto connect feature */
+		ret = auto_connect_le(connection->device);
+		if (ret)
+			device_set_state(connection->device,
+							DEVICE_CONNECT_INIT);
 		break;
 	case DEVICE_CONNECTED:
 		send_app_connect_notify(connection, GATT_SUCCESS);
@@ -1816,9 +1871,36 @@ static bool trigger_connection(struct app_connection *connection)
 	return ret;
 }
 
+static void remove_autoconnect_device(struct gatt_device *dev)
+{
+	bt_auto_connect_remove(&dev->bdaddr);
+
+	if (dev->state == DEVICE_CONNECT_INIT)
+		device_set_state(dev, DEVICE_DISCONNECTED);
+
+	device_unref(dev);
+}
+
+static void clear_autoconnect_devices(void *data, void *user_data)
+{
+	struct gatt_device *dev = data;
+
+	if (queue_remove(dev->autoconnect_apps, user_data))
+		if (queue_isempty(dev->autoconnect_apps))
+			remove_autoconnect_device(dev);
+
+
+}
+
 static uint8_t unregister_app(int client_if)
 {
 	struct gatt_app *cl;
+
+	/*
+	 * Make sure that there is no devices in auto connect list for this
+	 * application
+	 */
+	queue_foreach(gatt_devices, clear_autoconnect_devices, INT_TO_PTR(client_if));
 
 	cl = queue_remove_if(gatt_apps, match_app_by_id, INT_TO_PTR(client_if));
 	if (!cl) {
@@ -1834,44 +1916,100 @@ static uint8_t unregister_app(int client_if)
 	return HAL_STATUS_SUCCESS;
 }
 
+static void send_client_listen_notify(int32_t id, int32_t status)
+{
+	struct hal_ev_gatt_client_listen ev;
+
+	/* Server if because of typo in android headers */
+	ev.server_if = id;
+	ev.status = status;
+
+	ipc_send_notif(hal_ipc, HAL_SERVICE_ID_GATT, HAL_EV_GATT_CLIENT_LISTEN,
+							sizeof(ev), &ev);
+}
+
+struct listen_data {
+	int32_t client_id;
+	bool start;
+};
+
+static struct listen_data *create_listen_data(int32_t client_id, bool start)
+{
+	struct listen_data *d;
+
+	d = new0(struct listen_data, 1);
+	if (!d)
+		return NULL;
+
+	d->client_id = client_id;
+	d->start = start;
+
+	return d;
+}
+
+static void set_advertising_cb(uint8_t status, void *user_data)
+{
+	struct listen_data *l = user_data;
+
+	send_client_listen_notify(l->client_id, status);
+
+	/* In case of success update advertising state*/
+	if (!status)
+		advertising_cnt = l->start ? 1 : 0;
+
+	/*
+	 * Let's remove client from the list in two cases
+	 * 1. Start failed
+	 * 2. Stop succeed
+	 */
+	if ((l->start && status) || (!l->start && !status))
+		queue_remove(listen_apps, INT_TO_PTR(l->client_id));
+
+	free(l);
+}
+
 static void handle_client_unregister(const void *buf, uint16_t len)
 {
 	const struct hal_cmd_gatt_client_unregister *cmd = buf;
 	uint8_t status;
+	void *listening_client;
+	struct listen_data *data;
 
 	DBG("");
 
+	listening_client = queue_find(listen_apps, match_by_value,
+						INT_TO_PTR(cmd->client_if));
+
+	if (listening_client) {
+		advertising_cnt--;
+		queue_remove(listen_apps, INT_TO_PTR(cmd->client_if));
+	} else {
+		status = unregister_app(cmd->client_if);
+		goto reply;
+	}
+
+	if (!advertising_cnt) {
+		data = create_listen_data(cmd->client_if, false);
+		if (!data) {
+			error("gatt: Could not allocate listen data");
+			status = HAL_STATUS_NOMEM;
+			goto reply;
+		}
+
+		if (!bt_le_set_advertising(data->start, set_advertising_cb,
+								data)) {
+			error("gatt: Could not set advertising");
+			status = HAL_STATUS_FAILED;
+			free(data);
+			goto reply;
+		}
+	}
+
 	status = unregister_app(cmd->client_if);
 
+reply:
 	ipc_send_rsp(hal_ipc, HAL_SERVICE_ID_GATT,
 					HAL_OP_GATT_CLIENT_UNREGISTER, status);
-}
-
-static struct app_connection *find_conn(const bdaddr_t *addr, int32_t app_id)
-{
-	struct app_connection conn_match;
-	struct gatt_device *dev = NULL;
-	struct gatt_app *app;
-
-	/* Check if app is registered */
-	app = find_app_by_id(app_id);
-	if (!app) {
-		error("gatt: Client id %d not found", app_id);
-		return NULL;
-	}
-
-	/* Check if device is known */
-	dev = find_device_by_addr(addr);
-	if (!dev) {
-		error("gatt: Client id %d not found", app_id);
-		return NULL;
-	}
-
-	conn_match.device = dev;
-	conn_match.app = app;
-
-	return queue_find(app_connections, match_connection_by_device_and_app,
-								&conn_match);
 }
 
 static uint8_t handle_connect(int32_t app_id, const bdaddr_t *addr)
@@ -1948,44 +2086,6 @@ static void handle_client_disconnect(const void *buf, uint16_t len)
 					HAL_OP_GATT_CLIENT_DISCONNECT, status);
 }
 
-static void send_client_listen_notify(int32_t id, int32_t status)
-{
-	struct hal_ev_gatt_client_listen ev;
-
-	/* Server if because of typo in android headers */
-	ev.server_if = id;
-	ev.status = status;
-
-	ipc_send_notif(hal_ipc, HAL_SERVICE_ID_GATT, HAL_EV_GATT_CLIENT_LISTEN,
-							sizeof(ev), &ev);
-}
-
-struct listen_data {
-	int32_t client_id;
-	bool start;
-};
-
-static void set_advertising_cb(uint8_t status, void *user_data)
-{
-	struct listen_data *l = user_data;
-
-	send_client_listen_notify(l->client_id, status);
-
-	/* In case of success update advertising state*/
-	if (!status)
-		advertising_cnt = l->start ? 1 : 0;
-
-	/*
-	 * Let's remove client from the list in two cases
-	 * 1. Start failed
-	 * 2. Stop succeed
-	 */
-	if ((l->start && status) || (!l->start && !status))
-		queue_remove(listen_apps, INT_TO_PTR(l->client_id));
-
-	free(l);
-}
-
 static void handle_client_listen(const void *buf, uint16_t len)
 {
 	const struct hal_cmd_gatt_client_listen *cmd = buf;
@@ -2046,15 +2146,12 @@ static void handle_client_listen(const void *buf, uint16_t len)
 		}
 	}
 
-	data = new0(struct listen_data, 1);
+	data = create_listen_data(cmd->client_if, cmd->start);
 	if (!data) {
-		error("gatt: Could not allocate memory for listen data");
+		error("gatt: Could not allocate listen data");
 		status = HAL_STATUS_NOMEM;
 		goto reply;
 	}
-
-	data->client_id = cmd->client_if;
-	data->start = cmd->start;
 
 	if (!bt_le_set_advertising(cmd->start, set_advertising_cb, data)) {
 		error("gatt: Could not set advertising");
@@ -6115,8 +6212,6 @@ static void connect_confirm(GIOChannel *io, void *user_data)
 			error("gatt: Could not create device");
 			goto drop;
 		}
-
-		dev->bdaddr_type = dst_type;
 	} else {
 		if ((dev->state != DEVICE_DISCONNECTED) &&
 					!(dev->state == DEVICE_CONNECT_INIT &&
@@ -6129,6 +6224,8 @@ static void connect_confirm(GIOChannel *io, void *user_data)
 			goto drop;
 		}
 	}
+
+	dev->bdaddr_type = dst_type;
 
 	if (!bt_io_accept(io, connect_cb, device_ref(dev), NULL, NULL)) {
 		error("gatt: failed to accept connection");
@@ -6496,9 +6593,33 @@ static bool start_listening(void)
 	return true;
 }
 
+static void gatt_unpaired_cb(const bdaddr_t *addr, uint8_t type)
+{
+	struct gatt_device *dev;
+	char address[18];
+
+	dev = find_device_by_addr(addr);
+	if (!dev)
+		return;
+
+	if (dev->bdaddr_type != type)
+		return;
+
+	ba2str(addr, address);
+	DBG("Unpaired device %s", address);
+
+	queue_remove(gatt_devices, dev);
+	destroy_device(dev);
+}
+
 bool bt_gatt_register(struct ipc *ipc, const bdaddr_t *addr)
 {
 	DBG("");
+
+	if (!bt_unpaired_register(gatt_unpaired_cb)) {
+		error("gatt: Could not register unpaired callback");
+		return false;
+	}
 
 	if (!start_listening())
 		return false;
@@ -6628,6 +6749,7 @@ void bt_gatt_unregister(void)
 	crypto = NULL;
 
 	bt_le_unregister();
+	bt_unpaired_unregister(gatt_unpaired_cb);
 }
 
 unsigned int bt_gatt_register_app(const char *uuid, gatt_type_t type,
@@ -6690,4 +6812,54 @@ bool bt_gatt_disconnect_app(unsigned int id, const bdaddr_t *addr)
 	trigger_disconnection(conn);
 
 	return true;
+}
+
+bool bt_gatt_add_autoconnect(unsigned int id, const bdaddr_t *addr)
+{
+	struct gatt_device *dev;
+	struct gatt_app *app;
+
+	DBG("");
+
+	app = find_app_by_id(id);
+	if (!app) {
+		error("gatt: App ID=%d not found", id);
+		return false;
+	}
+
+	dev = find_device_by_addr(addr);
+	if (!dev) {
+		error("gatt: Device not found");
+		return false;
+	}
+
+	/* Take reference of device for auto connect purpose */
+	if (queue_isempty(dev->autoconnect_apps))
+		device_ref(dev);
+
+	if (!queue_find(dev->autoconnect_apps, match_by_value,
+							INT_TO_PTR(id)))
+		return queue_push_head(dev->autoconnect_apps, INT_TO_PTR(id));
+
+	return true;
+}
+
+void bt_gatt_remove_autoconnect(unsigned int id, const bdaddr_t *addr)
+{
+	struct gatt_device *dev;
+
+	DBG("");
+
+	dev = find_device_by_addr(addr);
+	if (!dev) {
+		error("gatt: Device not found");
+		return;
+	}
+
+	queue_remove(dev->autoconnect_apps, INT_TO_PTR(id));
+
+	if (queue_isempty(dev->autoconnect_apps))
+		remove_autoconnect_device(dev);
+
+		device_unref(dev);
 }

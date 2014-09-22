@@ -395,6 +395,24 @@ static int verify_property(bt_property_t *exp_props, int exp_num_props,
  * Check each test case step if test case expected
  * data is set and match it with expected result.
  */
+
+static bool verify_gatt_ids(btgatt_gatt_id_t *a, btgatt_gatt_id_t *b)
+{
+
+	if (memcmp(&a->uuid, &b->uuid, sizeof(bt_uuid_t)))
+		return false;
+
+	return true;
+}
+
+static bool verify_services(btgatt_srvc_id_t *a, btgatt_srvc_id_t *b)
+{
+	if (a->is_primary != b->is_primary)
+		return false;
+
+	return verify_gatt_ids(&a->id, &b->id);
+}
+
 static bool match_data(struct step *step)
 {
 	struct test_data *data = tester_get_data();
@@ -467,6 +485,36 @@ static bool match_data(struct step *step)
 			return false;
 		}
 
+		if (exp->callback_result.app_id !=
+					step->callback_result.app_id) {
+			tester_debug("Callback app_id don't match");
+			return false;
+		}
+
+		if (exp->callback_result.channel_id !=
+					step->callback_result.channel_id) {
+			tester_debug("Callback channel_id don't match");
+			return false;
+		}
+
+		if (exp->callback_result.mdep_cfg_index !=
+					step->callback_result.mdep_cfg_index) {
+			tester_debug("Callback mdep_cfg_index don't match");
+			return false;
+		}
+
+		if (exp->callback_result.app_state !=
+					step->callback_result.app_state) {
+			tester_debug("Callback app_state don't match");
+			return false;
+		}
+
+		if (exp->callback_result.channel_state !=
+					step->callback_result.channel_state) {
+			tester_debug("Callback channel_state don't match");
+			return false;
+		}
+
 		if (exp->callback_result.pairing_variant !=
 					step->callback_result.pairing_variant) {
 			tester_debug("Callback pairing result don't match");
@@ -497,6 +545,31 @@ static bool match_data(struct step *step)
 				step->callback_result.properties,
 				step->callback_result.num_properties)) {
 			tester_debug("Gatt properties don't match");
+			return false;
+		}
+
+		if (exp->callback_result.service &&
+				!verify_services(step->callback_result.service,
+						exp->callback_result.service)) {
+			tester_debug("Gatt service doesn't match");
+			return false;
+		}
+
+		if (exp->callback_result.characteristic) {
+			btgatt_gatt_id_t *a;
+			btgatt_gatt_id_t *b;
+			a = step->callback_result.characteristic;
+			b = exp->callback_result.characteristic;
+
+			if (!verify_gatt_ids(a, b)) {
+				tester_debug("Gatt char doesn't match");
+				return false;
+			}
+		}
+
+		if (exp->callback_result.char_prop !=
+					step->callback_result.char_prop) {
+			tester_debug("Gatt char prop doesn't match");
 			return false;
 		}
 	}
@@ -582,6 +655,12 @@ static void destroy_callback_step(void *data)
 
 	if (step->callback_result.properties)
 		free_properties(step);
+
+	if (step->callback_result.service)
+		free(step->callback_result.service);
+
+	if (step->callback_result.characteristic)
+		free(step->callback_result.characteristic);
 
 	g_free(step);
 	g_atomic_int_dec_and_test(&scheduled_cbacks_num);
@@ -811,6 +890,19 @@ static void ssp_request_cb(bt_bdaddr_t *remote_bd_addr,
 	schedule_callback_call(step);
 }
 
+static void acl_state_changed_cb(bt_status_t status,
+					bt_bdaddr_t *remote_bd_addr,
+					bt_acl_state_t state) {
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_BT_ACL_STATE_CHANGED;
+
+	step->callback_result.status = status;
+	step->callback_result.state = state;
+
+	schedule_callback_call(step);
+}
+
 static bt_callbacks_t bt_callbacks = {
 	.size = sizeof(bt_callbacks),
 	.adapter_state_changed_cb = adapter_state_changed_cb,
@@ -821,7 +913,7 @@ static bt_callbacks_t bt_callbacks = {
 	.pin_request_cb = pin_request_cb,
 	.ssp_request_cb = ssp_request_cb,
 	.bond_state_changed_cb = bond_state_changed_cb,
-	.acl_state_changed_cb = NULL,
+	.acl_state_changed_cb = acl_state_changed_cb,
 	.thread_evt_cb = NULL,
 	.dut_mode_recv_cb = NULL,
 	.le_test_mode_cb = NULL
@@ -987,6 +1079,44 @@ static void gattc_listen_cb(int status, int server_if)
 	schedule_callback_call(step);
 }
 
+static void gattc_search_result_cb(int conn_id, btgatt_srvc_id_t *srvc_id)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_SEARCH_RESULT;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.service = g_memdup(srvc_id, sizeof(*srvc_id));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_search_complete_cb(int conn_id, int status)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_SEARCH_COMPLETE;
+	step->callback_result.conn_id = conn_id;
+
+	schedule_callback_call(step);
+}
+
+static void gattc_get_characteristic_cb(int conn_id, int status,
+			btgatt_srvc_id_t *srvc_id, btgatt_gatt_id_t *char_id,
+			int char_prop)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_GET_CHARACTERISTIC;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.service = g_memdup(srvc_id, sizeof(*srvc_id));
+	step->callback_result.characteristic = g_memdup(char_id,
+							sizeof(*char_id));
+	step->callback_result.char_prop = char_prop;
+
+	schedule_callback_call(step);
+}
+
 static void pan_control_state_cb(btpan_control_state_t state,
 					bt_status_t error, int local_role,
 							const char *ifname)
@@ -1023,14 +1153,77 @@ static btpan_callbacks_t btpan_callbacks = {
 	.connection_state_cb = pan_connection_state_cb,
 };
 
+static void hdp_app_reg_state_cb(int app_id, bthl_app_reg_state_t state)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_HDP_APP_REG_STATE;
+	step->callback_result.app_id = app_id;
+	step->callback_result.app_state = state;
+
+	schedule_callback_call(step);
+}
+
+static void hdp_channel_state_cb(int app_id, bt_bdaddr_t *bd_addr,
+				int mdep_cfg_index, int channel_id,
+				bthl_channel_state_t state, int fd)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_HDP_CHANNEL_STATE;
+	step->callback_result.app_id = app_id;
+	step->callback_result.channel_id = channel_id;
+	step->callback_result.mdep_cfg_index = mdep_cfg_index;
+	step->callback_result.channel_state = state;
+
+	schedule_callback_call(step);
+}
+
+static bthl_callbacks_t bthl_callbacks = {
+	.size = sizeof(bthl_callbacks),
+	.app_reg_state_cb = hdp_app_reg_state_cb,
+	.channel_state_cb = hdp_channel_state_cb,
+};
+
+static void a2dp_connection_state_cb(btav_connection_state_t state,
+							bt_bdaddr_t *bd_addr)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_A2DP_CONN_STATE;
+	step->callback_result.state = state;
+
+	schedule_callback_call(step);
+}
+
+static void a2dp_audio_state_cb(btav_audio_state_t state, bt_bdaddr_t *bd_addr)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_A2DP_AUDIO_STATE;
+	step->callback_result.state = state;
+
+	schedule_callback_call(step);
+}
+
+static btav_callbacks_t bta2dp_callbacks = {
+	.size = sizeof(bta2dp_callbacks),
+	.connection_state_cb = a2dp_connection_state_cb,
+	.audio_state_cb = a2dp_audio_state_cb,
+};
+
+static btrc_callbacks_t btavrcp_callbacks = {
+	.size = sizeof(btavrcp_callbacks),
+};
+
 static const btgatt_client_callbacks_t btgatt_client_callbacks = {
 	.register_client_cb = gattc_register_client_cb,
 	.scan_result_cb = gattc_scan_result_cb,
 	.open_cb = gattc_connect_cb,
 	.close_cb = gattc_disconnect_cb,
-	.search_complete_cb = NULL,
-	.search_result_cb = NULL,
-	.get_characteristic_cb = NULL,
+	.search_complete_cb = gattc_search_complete_cb,
+	.search_result_cb = gattc_search_result_cb,
+	.get_characteristic_cb = gattc_get_characteristic_cb,
 	.get_descriptor_cb = NULL,
 	.get_included_service_cb = NULL,
 	.register_for_notification_cb = NULL,
@@ -1107,6 +1300,15 @@ static bool setup_base(struct test_data *data)
 
 	close(signal_fd[0]);
 
+	err = hw_get_module_by_class(AUDIO_HARDWARE_MODULE_ID,
+					AUDIO_HARDWARE_MODULE_ID_A2DP, &module);
+	if (err)
+		return false;
+
+	err = audio_hw_device_open(module, &data->audio);
+	if (err)
+		return false;
+
 	err = hw_get_module(BT_HARDWARE_MODULE_ID, &module);
 	if (err)
 		return false;
@@ -1125,6 +1327,11 @@ static bool setup_base(struct test_data *data)
 	if (!(data->steps = queue_new()))
 		return false;
 
+	data->pdus = queue_new();
+	if (!data->pdus) {
+		queue_destroy(data->steps, NULL);
+		return false;
+	}
 
 	return true;
 }
@@ -1250,6 +1457,135 @@ static void setup_pan(const void *test_data)
 	tester_setup_complete();
 }
 
+static void setup_hdp(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	bt_status_t status;
+	const void *hdp;
+
+	if (!setup_base(data)) {
+		tester_setup_failed();
+		return;
+	}
+
+	status = data->if_bluetooth->init(&bt_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_bluetooth = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	hdp = data->if_bluetooth->get_profile_interface(BT_PROFILE_HEALTH_ID);
+	if (!hdp) {
+		tester_setup_failed();
+		return;
+	}
+
+	data->if_hdp = hdp;
+
+	status = data->if_hdp->init(&bthl_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_hdp = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	tester_setup_complete();
+}
+
+static void setup_a2dp(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	const bt_interface_t *if_bt;
+	bt_status_t status;
+	const void *a2dp;
+
+	if (!setup_base(data)) {
+		tester_setup_failed();
+		return;
+	}
+
+	if_bt = data->if_bluetooth;
+
+	status = if_bt->init(&bt_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_bluetooth = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	a2dp = if_bt->get_profile_interface(BT_PROFILE_ADVANCED_AUDIO_ID);
+	if (!a2dp) {
+		tester_setup_failed();
+		return;
+	}
+
+	data->if_a2dp = a2dp;
+
+	status = data->if_a2dp->init(&bta2dp_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_a2dp = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	tester_setup_complete();
+}
+
+static void setup_avrcp(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	const bt_interface_t *if_bt;
+	bt_status_t status;
+	const void *a2dp, *avrcp;
+
+	if (!setup_base(data)) {
+		tester_setup_failed();
+		return;
+	}
+
+	if_bt = data->if_bluetooth;
+
+	status = if_bt->init(&bt_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_bluetooth = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	a2dp = if_bt->get_profile_interface(BT_PROFILE_ADVANCED_AUDIO_ID);
+	if (!a2dp) {
+		tester_setup_failed();
+		return;
+	}
+
+	data->if_a2dp = a2dp;
+
+	status = data->if_a2dp->init(&bta2dp_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_a2dp = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	avrcp = if_bt->get_profile_interface(BT_PROFILE_AV_RC_ID);
+	if (!a2dp) {
+		tester_setup_failed();
+		return;
+	}
+
+	data->if_avrcp = avrcp;
+
+	status = data->if_avrcp->init(&btavrcp_callbacks);
+	if (status != BT_STATUS_SUCCESS) {
+		data->if_avrcp = NULL;
+		tester_setup_failed();
+		return;
+	}
+
+	tester_setup_complete();
+}
+
 static void setup_gatt(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -1294,6 +1630,9 @@ static void teardown(const void *test_data)
 	queue_destroy(data->steps, NULL);
 	data->steps = NULL;
 
+	queue_destroy(data->pdus, NULL);
+	data->pdus = NULL;
+
 	if (data->if_gatt) {
 		data->if_gatt->cleanup();
 		data->if_gatt = NULL;
@@ -1309,12 +1648,39 @@ static void teardown(const void *test_data)
 		data->if_pan = NULL;
 	}
 
+	if (data->if_hdp) {
+		data->if_hdp->cleanup();
+		data->if_hdp = NULL;
+	}
+
+	if (data->if_stream) {
+		data->audio->close_output_stream(data->audio, data->if_stream);
+		data->if_stream = NULL;
+	}
+
+	if (data->if_a2dp) {
+		data->if_a2dp->cleanup();
+		data->if_a2dp = NULL;
+	}
+
+	if (data->if_avrcp) {
+		data->if_avrcp->cleanup();
+		data->if_avrcp = NULL;
+	}
+
 	if (data->if_bluetooth) {
 		data->if_bluetooth->cleanup();
 		data->if_bluetooth = NULL;
 	}
 
 	data->device->close(data->device);
+	audio_hw_device_close(data->audio);
+
+	/*
+	 * Ssp_request_cb pointer can be set do default_ssp_req_cb.
+	 * Set it back to ssp_request_cb
+	 */
+	bt_callbacks.ssp_request_cb = ssp_request_cb;
 
 	if (!data->bluetoothd_pid)
 		tester_teardown_complete();
@@ -1401,6 +1767,83 @@ void emu_set_ssp_mode_action(void)
 	bthost = hciemu_client_get_host(data->hciemu);
 
 	bthost_write_ssp_mode(bthost, 0x01);
+
+	step->action_status = BT_STATUS_SUCCESS;
+
+	schedule_action_verification(step);
+}
+
+void emu_set_connect_cb_action(void)
+{
+	struct test_data *data = tester_get_data();
+	struct bthost *bthost = hciemu_client_get_host(data->hciemu);
+	struct step *current_data_step = queue_peek_head(data->steps);
+	void *cb = current_data_step->set_data;
+	struct step *step = g_new0(struct step, 1);
+
+	bthost_set_connect_cb(bthost, cb, data);
+
+	step->action_status = BT_STATUS_SUCCESS;
+
+	schedule_action_verification(step);
+}
+
+void emu_remote_connect_hci_action(void)
+{
+	struct test_data *data = tester_get_data();
+	struct bthost *bthost = hciemu_client_get_host(data->hciemu);
+	struct step *current_data_step = queue_peek_head(data->steps);
+	struct bt_action_data *action_data = current_data_step->set_data;
+	struct step *step = g_new0(struct step, 1);
+	const uint8_t *master_addr;
+
+	master_addr = hciemu_get_master_bdaddr(data->hciemu);
+
+	tester_print("Trying to connect hci");
+
+	if (action_data)
+		bthost_hci_connect(bthost, master_addr,
+						action_data->bearer_type);
+	else
+		bthost_hci_connect(bthost, master_addr, BDADDR_BREDR);
+
+	step->action_status = BT_STATUS_SUCCESS;
+
+	schedule_action_verification(step);
+}
+
+void emu_remote_disconnect_hci_action(void)
+{
+	struct test_data *data = tester_get_data();
+	struct bthost *bthost = hciemu_client_get_host(data->hciemu);
+	struct step *current_data_step = queue_peek_head(data->steps);
+	uint16_t *handle = current_data_step->set_data;
+	struct step *step = g_new0(struct step, 1);
+
+	if (handle) {
+		bthost_hci_disconnect(bthost, *handle, 0x13);
+		step->action_status = BT_STATUS_SUCCESS;
+	} else {
+		step->action_status = BT_STATUS_FAIL;
+	}
+
+	schedule_action_verification(step);
+}
+
+void emu_set_io_cap(void)
+{
+	struct test_data *data = tester_get_data();
+	struct bthost *bthost;
+	struct step *current_data_step = queue_peek_head(data->steps);
+	struct bt_action_data *action_data = current_data_step->set_data;
+	struct step *step = g_new0(struct step, 1);
+
+	bthost = hciemu_client_get_host(data->hciemu);
+
+	if (action_data)
+		bthost_set_io_capability(bthost, action_data->io_cap);
+	else
+		bthost_set_io_capability(bthost, 0x01);
 
 	step->action_status = BT_STATUS_SUCCESS;
 
@@ -1510,8 +1953,7 @@ void bt_set_property_action(void)
 
 	prop = (bt_property_t *)current_data_step->set_data;
 
-	step->action_status = data->if_bluetooth->set_adapter_property(
-									prop);
+	step->action_status = data->if_bluetooth->set_adapter_property(prop);
 
 	schedule_action_verification(step);
 }
@@ -1694,6 +2136,27 @@ void bt_remove_bond_action(void)
 	schedule_action_verification(step);
 }
 
+static void default_ssp_req_cb(bt_bdaddr_t *remote_bd_addr, bt_bdname_t *name,
+				uint32_t cod, bt_ssp_variant_t pairing_variant,
+				uint32_t pass_key)
+{
+	struct test_data *t_data = tester_get_data();
+
+	t_data->if_bluetooth->ssp_reply(remote_bd_addr, pairing_variant, true,
+								pass_key);
+}
+
+void set_default_ssp_request_handler(void)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	bt_callbacks.ssp_request_cb = default_ssp_req_cb;
+
+	step->action_status = BT_STATUS_SUCCESS;
+
+	schedule_action_verification(step);
+}
+
 static void generic_test_function(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -1728,6 +2191,12 @@ static void tester_testcases_cleanup(void)
 {
 	remove_bluetooth_tests();
 	remove_socket_tests();
+	remove_hidhost_tests();
+	remove_gatt_tests();
+	remove_a2dp_tests();
+	remove_avrcp_tests();
+	remove_hdp_tests();
+	remove_pan_tests();
 }
 
 static void add_bluetooth_tests(void *data, void *user_data)
@@ -1758,6 +2227,27 @@ static void add_pan_tests(void *data, void *user_data)
 	test(tc, setup_pan, generic_test_function, teardown);
 }
 
+static void add_hdp_tests(void *data, void *user_data)
+{
+	struct test_case *tc = data;
+
+	test(tc, setup_hdp, generic_test_function, teardown);
+}
+
+static void add_a2dp_tests(void *data, void *user_data)
+{
+	struct test_case *tc = data;
+
+	test(tc, setup_a2dp, generic_test_function, teardown);
+}
+
+static void add_avrcp_tests(void *data, void *user_data)
+{
+	struct test_case *tc = data;
+
+	test(tc, setup_avrcp, generic_test_function, teardown);
+}
+
 static void add_gatt_tests(void *data, void *user_data)
 {
 	struct test_case *tc = data;
@@ -1775,6 +2265,9 @@ int main(int argc, char *argv[])
 	queue_foreach(get_socket_tests(), add_socket_tests, NULL);
 	queue_foreach(get_hidhost_tests(), add_hidhost_tests, NULL);
 	queue_foreach(get_pan_tests(), add_pan_tests, NULL);
+	queue_foreach(get_hdp_tests(), add_hdp_tests, NULL);
+	queue_foreach(get_a2dp_tests(), add_a2dp_tests, NULL);
+	queue_foreach(get_avrcp_tests(), add_avrcp_tests, NULL);
 	queue_foreach(get_gatt_tests(), add_gatt_tests, NULL);
 
 	if (tester_run())

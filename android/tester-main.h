@@ -43,10 +43,14 @@
 #include "src/shared/queue.h"
 
 #include <hardware/hardware.h>
+#include <hardware/audio.h>
 #include <hardware/bluetooth.h>
 #include <hardware/bt_sock.h>
 #include <hardware/bt_hh.h>
 #include <hardware/bt_pan.h>
+#include <hardware/bt_hl.h>
+#include <hardware/bt_av.h>
+#include <hardware/bt_rc.h>
 #include <hardware/bt_gatt.h>
 #include <hardware/bt_gatt_client.h>
 #include <hardware/bt_gatt_server.h>
@@ -65,23 +69,17 @@
 		(struct step[]) {__VA_ARGS__}, \
 	}
 
-#define ACTION_SUCCESS(act_fun, data_set) { \
-		.action_status = BT_STATUS_SUCCESS, \
-		.action = act_fun, \
-		.set_data = data_set, \
-	}
-
-#define ACTION_FAIL(act_fun, data_set) { \
-		.action_status = BT_STATUS_FAIL, \
-		.action = act_fun, \
-		.set_data = data_set, \
-	}
-
 #define ACTION(status, act_fun, data_set) { \
 		.action_status = status, \
 		.action = act_fun, \
 		.set_data = data_set, \
 	}
+
+#define ACTION_FAIL(act_fun, data_set) \
+		ACTION(BT_STATUS_FAIL, act_fun, data_set)
+
+#define ACTION_SUCCESS(act_fun, data_set) \
+		ACTION(BT_STATUS_SUCCESS, act_fun, data_set)
 
 #define CALLBACK(cb) { \
 		.callback = cb, \
@@ -137,6 +135,26 @@
 		.callback_result.client_id = cb_client_id, \
 	}
 
+#define CALLBACK_GATTC_SEARCH_RESULT(cb_conn_id, cb_service) { \
+		.callback = CB_GATTC_SEARCH_RESULT, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.service = cb_service \
+	}
+
+#define CALLBACK_GATTC_SEARCH_COMPLETE(cb_res, cb_conn_id) { \
+		.callback = CB_GATTC_SEARCH_COMPLETE, \
+		.callback_result.conn_id = cb_conn_id \
+	}
+#define CALLBACK_GATTC_GET_CHARACTERISTIC_CB(cb_res, cb_conn_id, cb_service, \
+						cb_char, cb_char_prop) { \
+		.callback = CB_GATTC_GET_CHARACTERISTIC, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.service = cb_service, \
+		.callback_result.characteristic = cb_char, \
+		.callback_result.char_prop = cb_char_prop \
+	}
+
 #define CALLBACK_GATTC_DISCONNECT(cb_res, cb_prop, cb_conn_id, cb_client_id) { \
 		.callback = CB_GATTC_CLOSE, \
 		.callback_result.status = cb_res, \
@@ -160,6 +178,31 @@
 		.callback_result.conn_state = cb_state, \
 		.callback_result.local_role = cb_local_role, \
 		.callback_result.remote_role = cb_remote_role, \
+	}
+
+#define CALLBACK_HDP_APP_REG_STATE(cb, cb_app_id, cb_state) { \
+		.callback = cb, \
+		.callback_result.app_id = cb_app_id, \
+		.callback_result.app_state = cb_state, \
+	}
+
+#define CALLBACK_HDP_CHANNEL_STATE(cb, cb_app_id, cb_channel_id, \
+					cb_mdep_cfg_index, cb_state) { \
+		.callback = cb, \
+		.callback_result.app_id = cb_app_id, \
+		.callback_result.channel_id = cb_channel_id, \
+		.callback_result.mdep_cfg_index = cb_mdep_cfg_index, \
+		.callback_result.channel_state = cb_state, \
+	}
+
+#define CALLBACK_AV_CONN_STATE(cb, cb_state) { \
+		.callback = cb, \
+		.callback_result.state = cb_state, \
+	}
+
+#define CALLBACK_AV_AUDIO_STATE(cb, cb_state) { \
+		.callback = cb, \
+		.callback_result.state = cb_state, \
 	}
 
 #define CALLBACK_DEVICE_PROPS(props, prop_cnt) \
@@ -221,6 +264,14 @@ typedef enum {
 	CB_PAN_CONTROL_STATE,
 	CB_PAN_CONNECTION_STATE,
 
+	/* HDP cb */
+	CB_HDP_APP_REG_STATE,
+	CB_HDP_CHANNEL_STATE,
+
+	/* A2DP cb */
+	CB_A2DP_CONN_STATE,
+	CB_A2DP_AUDIO_STATE,
+
 	/* Gatt client */
 	CB_GATTC_REGISTER_CLIENT,
 	CB_GATTC_SCAN_RESULT,
@@ -259,6 +310,7 @@ typedef enum {
 
 struct test_data {
 	struct mgmt *mgmt;
+	audio_hw_device_t *audio;
 	struct hw_device_t *device;
 	struct hciemu *hciemu;
 	enum hciemu_type hciemu_type;
@@ -267,6 +319,10 @@ struct test_data {
 	const btsock_interface_t *if_sock;
 	const bthh_interface_t *if_hid;
 	const btpan_interface_t *if_pan;
+	const bthl_interface_t *if_hdp;
+	const btav_interface_t *if_a2dp;
+	struct audio_stream_out *if_stream;
+	const btrc_interface_t *if_avrcp;
 	const btgatt_interface_t *if_gatt;
 
 	const void *test_data;
@@ -275,6 +331,8 @@ struct test_data {
 	guint signalfd;
 	uint16_t mgmt_index;
 	pid_t bluetoothd_pid;
+
+	struct queue *pdus;
 };
 
 /*
@@ -292,6 +350,7 @@ struct bt_action_data {
 	const uint8_t pin_len;
 	const uint8_t ssp_variant;
 	const bool accept;
+	const uint16_t io_cap;
 
 	/* Socket HAL specific params */
 	const btsock_type_t sock_type;
@@ -303,6 +362,9 @@ struct bt_action_data {
 
 	/* HidHost params */
 	const int report_size;
+
+	/*Connection params*/
+	const uint8_t bearer_type;
 };
 
 /* bthost's l2cap server setup parameters */
@@ -332,11 +394,20 @@ struct bt_callback_data {
 
 	int client_id;
 	int conn_id;
+	btgatt_srvc_id_t *service;
+	btgatt_gatt_id_t *characteristic;
+	int char_prop;
 
 	btpan_control_state_t ctrl_state;
 	btpan_connection_state_t conn_state;
 	int local_role;
 	int remote_role;
+
+	int app_id;
+	int channel_id;
+	int mdep_cfg_index;
+	bthl_app_reg_state_t app_state;
+	bthl_channel_state_t channel_state;
 };
 
 /*
@@ -358,7 +429,7 @@ struct test_case {
 	const uint8_t emu_type;
 	const char *title;
 	const uint16_t step_num;
-	const struct step const *step;
+	const struct step *step;
 };
 
 /* Get, remove test cases API */
@@ -370,6 +441,12 @@ struct queue *get_hidhost_tests(void);
 void remove_hidhost_tests(void);
 struct queue *get_pan_tests(void);
 void remove_pan_tests(void);
+struct queue *get_hdp_tests(void);
+void remove_hdp_tests(void);
+struct queue *get_a2dp_tests(void);
+void remove_a2dp_tests(void);
+struct queue *get_avrcp_tests(void);
+void remove_avrcp_tests(void);
 struct queue *get_gatt_tests(void);
 void remove_gatt_tests(void);
 
@@ -380,6 +457,10 @@ void schedule_action_verification(struct step *step);
 void emu_setup_powered_remote_action(void);
 void emu_set_pin_code_action(void);
 void emu_set_ssp_mode_action(void);
+void emu_set_connect_cb_action(void);
+void emu_remote_connect_hci_action(void);
+void emu_remote_disconnect_hci_action(void);
+void emu_set_io_cap(void);
 void emu_add_l2cap_server_action(void);
 void emu_add_rfcomm_server_action(void);
 
@@ -399,3 +480,4 @@ void bt_pin_reply_accept_action(void);
 void bt_ssp_reply_accept_action(void);
 void bt_cancel_bond_action(void);
 void bt_remove_bond_action(void);
+void set_default_ssp_request_handler(void);

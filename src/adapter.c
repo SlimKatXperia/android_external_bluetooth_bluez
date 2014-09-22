@@ -4663,7 +4663,7 @@ static void update_found_devices(struct btd_adapter *adapter,
 
 	if (bdaddr_type == BDADDR_BREDR)
 		discoverable = true;
-	 else
+	else
 		discoverable = eir_data.flags & (EIR_LIM_DISC | EIR_GEN_DISC);
 
 	ba2str(bdaddr, addr);
@@ -4964,6 +4964,16 @@ static void agent_auth_cb(struct agent *agent, DBusError *derr,
 
 	g_free(auth);
 
+	/* Stop processing if queue is empty */
+	if (g_queue_is_empty(adapter->auths)) {
+		if (adapter->auth_idle_id > 0)
+			g_source_remove(adapter->auth_idle_id);
+		return;
+	}
+
+	if (adapter->auth_idle_id > 0)
+		return;
+
 	adapter->auth_idle_id = g_idle_add(process_auth_queue, adapter);
 }
 
@@ -4984,12 +4994,16 @@ static gboolean process_auth_queue(gpointer user_data)
 
 		/* Wait services to be resolved before asking authorization */
 		if (auth->svc_id > 0)
-			return TRUE;
+			return FALSE;
 
 		if (device_is_trusted(device) == TRUE) {
 			auth->cb(NULL, auth->user_data);
 			goto next;
 		}
+
+		/* If agent is set authorization is already ongoing */
+		if (auth->agent)
+			return FALSE;
 
 		auth->agent = agent_get(NULL);
 		if (auth->agent == NULL) {
@@ -5533,7 +5547,7 @@ static void pin_code_request_callback(uint16_t index, uint16_t length,
 }
 
 int adapter_cancel_bonding(struct btd_adapter *adapter, const bdaddr_t *bdaddr,
-							 uint8_t addr_type)
+							uint8_t addr_type)
 {
 	struct mgmt_addr_info cp;
 	char addr[18];
