@@ -33,10 +33,10 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 
 #include <sys/param.h>
 #include <sys/uio.h>
-#include <sys/poll.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -2924,6 +2924,38 @@ int hci_le_conn_update(int dd, uint16_t handle, uint16_t min_interval,
 		errno = EIO;
 		return -1;
 	}
+
+	return 0;
+}
+
+int hci_le_read_remote_features(int dd, uint16_t handle, uint8_t *features, int to)
+{
+	evt_le_read_remote_used_features_complete rp;
+	le_read_remote_used_features_cp cp;
+	struct hci_request rq;
+
+	memset(&cp, 0, sizeof(cp));
+	cp.handle = handle;
+
+	memset(&rq, 0, sizeof(rq));
+	rq.ogf    = OGF_LE_CTL;
+	rq.ocf    = OCF_LE_READ_REMOTE_USED_FEATURES;
+	rq.event  = EVT_LE_READ_REMOTE_USED_FEATURES_COMPLETE;
+	rq.cparam = &cp;
+	rq.clen   = LE_READ_REMOTE_USED_FEATURES_CP_SIZE;
+	rq.rparam = &rp;
+	rq.rlen   = EVT_LE_READ_REMOTE_USED_FEATURES_COMPLETE_SIZE;
+
+	if (hci_send_req(dd, &rq, to) < 0)
+		return -1;
+
+	if (rp.status) {
+		errno = EIO;
+		return -1;
+	}
+
+	if (features)
+		memcpy(features, rp.features, 8);
 
 	return 0;
 }

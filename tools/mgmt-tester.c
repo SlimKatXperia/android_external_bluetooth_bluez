@@ -35,11 +35,11 @@
 
 #include "monitor/bt.h"
 #include "emulator/bthost.h"
+#include "emulator/hciemu.h"
 
 #include "src/shared/util.h"
 #include "src/shared/tester.h"
 #include "src/shared/mgmt.h"
-#include "src/shared/hciemu.h"
 
 struct test_data {
 	tester_data_func_t test_setup;
@@ -379,6 +379,7 @@ struct generic_data {
 	uint32_t expect_settings_unset;
 	uint16_t expect_alt_ev;
 	const void *expect_alt_ev_param;
+	bool (*verify_alt_ev_func)(const void *param, uint16_t length);
 	uint16_t expect_alt_ev_len;
 	uint16_t expect_hci_command;
 	const void *expect_hci_param;
@@ -393,8 +394,8 @@ struct generic_data {
 	uint8_t io_cap;
 	uint8_t client_io_cap;
 	uint8_t client_auth_req;
-	bool reject_ssp;
-	bool client_reject_ssp;
+	bool reject_confirm;
+	bool client_reject_confirm;
 	bool just_works;
 };
 
@@ -2291,7 +2292,10 @@ static const void *pair_device_send_param_func(uint16_t *len)
 	static uint8_t param[8];
 
 	memcpy(param, hciemu_get_client_bdaddr(data->hciemu), 6);
-	param[6] = 0x00; /* Address type */
+	if (data->hciemu_type == HCIEMU_TYPE_LE)
+		param[6] = 0x01; /* Address type */
+	else
+		param[6] = 0x00; /* Address type */
 	param[7] = test->io_cap;
 
 	*len = sizeof(param);
@@ -2305,7 +2309,10 @@ static const void *pair_device_expect_param_func(uint16_t *len)
 	static uint8_t param[7];
 
 	memcpy(param, hciemu_get_client_bdaddr(data->hciemu), 6);
-	param[6] = 0x00; /* Address type */
+	if (data->hciemu_type == HCIEMU_TYPE_LE)
+		param[6] = 0x01; /* Address type */
+	else
+		param[6] = 0x00; /* Address type */
 
 	*len = sizeof(param);
 
@@ -2570,7 +2577,7 @@ static const struct generic_data pair_device_ssp_reject_1 = {
 	.io_cap = 0x01, /* DisplayYesNo */
 	.client_io_cap = 0x01, /* DisplayYesNo */
 	.client_auth_req = 0x01, /* No Bonding - MITM */
-	.reject_ssp = true,
+	.reject_confirm = true,
 };
 
 static const struct generic_data pair_device_ssp_reject_2 = {
@@ -2586,7 +2593,7 @@ static const struct generic_data pair_device_ssp_reject_2 = {
 	.expect_hci_func = client_bdaddr_param_func,
 	.io_cap = 0x01, /* DisplayYesNo */
 	.client_io_cap = 0x01, /* DisplayYesNo */
-	.client_reject_ssp = true,
+	.client_reject_confirm = true,
 };
 
 static const struct generic_data pair_device_ssp_nonbondable_1 = {
@@ -2602,6 +2609,68 @@ static const struct generic_data pair_device_ssp_nonbondable_1 = {
 	.expect_hci_func = client_bdaddr_param_func,
 	.io_cap = 0x01, /* DisplayYesNo */
 	.client_io_cap = 0x01, /* DisplayYesNo */
+};
+
+static const struct generic_data pair_device_le_success_test_1 = {
+	.setup_settings = settings_powered_bondable,
+	.send_opcode = MGMT_OP_PAIR_DEVICE,
+	.send_func = pair_device_send_param_func,
+	.just_works = true,
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_func = pair_device_expect_param_func,
+	.expect_alt_ev =  MGMT_EV_NEW_LONG_TERM_KEY,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_new_long_term_key),
+};
+
+static bool verify_ltk(const void *param, uint16_t length)
+{
+	struct test_data *data = tester_get_data();
+	const struct generic_data *test = data->test_data;
+	const struct mgmt_ev_new_long_term_key *ev = param;
+
+	if (length != sizeof(struct mgmt_ev_new_long_term_key)) {
+		tester_warn("Invalid new ltk length %u != %zu", length,
+				sizeof(struct mgmt_ev_new_long_term_key));
+		return false;
+	}
+
+	if (test->just_works && ev->key.type != 0x00) {
+		tester_warn("Authenticated key for just-works");
+		return false;
+	}
+
+	if (!test->just_works && ev->key.type != 0x01) {
+		tester_warn("Unauthenticated key for MITM");
+		return false;
+	}
+
+	return true;
+}
+
+static const struct generic_data pair_device_le_success_test_2 = {
+	.setup_settings = settings_powered_bondable,
+	.io_cap = 0x02, /* KeyboardOnly */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.send_opcode = MGMT_OP_PAIR_DEVICE,
+	.send_func = pair_device_send_param_func,
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_func = pair_device_expect_param_func,
+	.expect_alt_ev =  MGMT_EV_NEW_LONG_TERM_KEY,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_new_long_term_key),
+	.verify_alt_ev_func = verify_ltk,
+};
+
+static const struct generic_data pair_device_le_reject_test_1 = {
+	.setup_settings = settings_powered_bondable,
+	.io_cap = 0x02, /* KeyboardOnly */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.send_opcode = MGMT_OP_PAIR_DEVICE,
+	.send_func = pair_device_send_param_func,
+	.expect_status = MGMT_STATUS_AUTH_FAILED,
+	.expect_func = pair_device_expect_param_func,
+	.expect_alt_ev =  MGMT_EV_AUTH_FAILED,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_auth_failed),
+	.reject_confirm = true,
 };
 
 static uint16_t settings_powered_connectable_bondable[] = {
@@ -2732,6 +2801,61 @@ static const struct generic_data pairing_acceptor_ssp_4 = {
 	.io_cap = 0x01, /* DisplayYesNo */
 	.client_io_cap = 0x01, /* DisplayYesNo */
 	.client_auth_req = 0x02, /* Dedicated Bonding - No MITM */
+};
+
+static uint16_t settings_powered_bondable_connectable_advertising[] = {
+					MGMT_OP_SET_BONDABLE,
+					MGMT_OP_SET_CONNECTABLE,
+					MGMT_OP_SET_ADVERTISING,
+					MGMT_OP_SET_POWERED, 0 };
+
+static const struct generic_data pairing_acceptor_le_1 = {
+	.setup_settings = settings_powered_bondable_connectable_advertising,
+	.io_cap = 0x03, /* NoInputNoOutput */
+	.client_io_cap = 0x03, /* NoInputNoOutput */
+	.just_works = true,
+	.expect_alt_ev =  MGMT_EV_NEW_LONG_TERM_KEY,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_new_long_term_key),
+	.verify_alt_ev_func = verify_ltk,
+};
+
+static const struct generic_data pairing_acceptor_le_2 = {
+	.setup_settings = settings_powered_bondable_connectable_advertising,
+	.io_cap = 0x04, /* KeyboardDisplay */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.client_auth_req = 0x05, /* Bonding - MITM */
+	.expect_alt_ev =  MGMT_EV_NEW_LONG_TERM_KEY,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_new_long_term_key),
+	.verify_alt_ev_func = verify_ltk,
+};
+
+static const struct generic_data pairing_acceptor_le_3 = {
+	.setup_settings = settings_powered_bondable_connectable_advertising,
+	.io_cap = 0x04, /* KeyboardDisplay */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.expect_alt_ev =  MGMT_EV_AUTH_FAILED,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_auth_failed),
+	.reject_confirm = true,
+};
+
+static const struct generic_data pairing_acceptor_le_4 = {
+	.setup_settings = settings_powered_bondable_connectable_advertising,
+	.io_cap = 0x02, /* KeyboardOnly */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.client_auth_req = 0x05, /* Bonding - MITM */
+	.expect_alt_ev =  MGMT_EV_NEW_LONG_TERM_KEY,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_new_long_term_key),
+	.verify_alt_ev_func = verify_ltk,
+};
+
+static const struct generic_data pairing_acceptor_le_5 = {
+	.setup_settings = settings_powered_bondable_connectable_advertising,
+	.io_cap = 0x02, /* KeyboardOnly */
+	.client_io_cap = 0x04, /* KeyboardDisplay */
+	.client_auth_req = 0x05, /* Bonding - MITM */
+	.reject_confirm = true,
+	.expect_alt_ev =  MGMT_EV_AUTH_FAILED,
+	.expect_alt_ev_len = sizeof(struct mgmt_ev_auth_failed),
 };
 
 static const char unpair_device_param[] = {
@@ -3260,7 +3384,7 @@ static void setup_bthost(void)
 		bthost_write_scan_enable(bthost, 0x03);
 }
 
-static void setup_ssp_acceptor(const void *test_data)
+static void setup_pairing_acceptor(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 	const struct generic_data *test = data->test_data;
@@ -3602,13 +3726,42 @@ static void user_confirm_request_callback(uint16_t index, uint16_t length,
 	memset(&cp, 0, sizeof(cp));
 	memcpy(&cp.addr, &ev->addr, sizeof(cp.addr));
 
-	if (test->reject_ssp)
+	if (test->reject_confirm)
 		opcode = MGMT_OP_USER_CONFIRM_NEG_REPLY;
 	else
 		opcode = MGMT_OP_USER_CONFIRM_REPLY;
 
 	mgmt_reply(data->mgmt, opcode, data->mgmt_index, sizeof(cp), &cp,
 							NULL, NULL, NULL);
+}
+
+static void user_passkey_request_callback(uint16_t index, uint16_t length,
+							const void *param,
+							void *user_data)
+{
+	const struct mgmt_ev_user_passkey_request *ev = param;
+	struct test_data *data = user_data;
+	const struct generic_data *test = data->test_data;
+	struct mgmt_cp_user_passkey_reply cp;
+
+	if (test->just_works) {
+		tester_warn("User Passkey Request for just-works case");
+		tester_test_failed();
+		return;
+	}
+
+	memset(&cp, 0, sizeof(cp));
+	memcpy(&cp.addr, &ev->addr, sizeof(cp.addr));
+
+	if (test->reject_confirm) {
+		mgmt_reply(data->mgmt, MGMT_OP_USER_PASSKEY_NEG_REPLY,
+				data->mgmt_index, sizeof(cp.addr), &cp.addr,
+				NULL, NULL, NULL);
+		return;
+	}
+
+	mgmt_reply(data->mgmt, MGMT_OP_USER_PASSKEY_REPLY, data->mgmt_index,
+					sizeof(cp), &cp, NULL, NULL, NULL);
 }
 
 static void test_setup(const void *test_data)
@@ -3632,6 +3785,10 @@ static void test_setup(const void *test_data)
 			data->mgmt_index, user_confirm_request_callback,
 			data, NULL);
 
+	mgmt_register(data->mgmt, MGMT_EV_USER_PASSKEY_REQUEST,
+			data->mgmt_index, user_passkey_request_callback,
+			data, NULL);
+
 	if (test->client_pin)
 		bthost_set_pin_code(bthost, test->client_pin,
 							test->client_pin_len);
@@ -3644,7 +3801,7 @@ static void test_setup(const void *test_data)
 	else if (!test->just_works)
 		bthost_set_auth_req(bthost, 0x01);
 
-	if (test->client_reject_ssp)
+	if (test->client_reject_confirm)
 		bthost_set_reject_user_confirm(bthost, true);
 
 proceed:
@@ -3740,31 +3897,49 @@ done:
 	test_condition_complete(data);
 }
 
+static bool verify_alt_ev(const void *param, uint16_t length)
+{
+	struct test_data *data = tester_get_data();
+	const struct generic_data *test = data->test_data;
+
+	if (length != test->expect_alt_ev_len) {
+		tester_warn("Invalid length %u != %u", length,
+						test->expect_alt_ev_len);
+		return false;
+	}
+
+	if (test->expect_alt_ev_param &&
+			memcmp(test->expect_alt_ev_param, param, length)) {
+		tester_warn("Event parameters do not match");
+		return false;
+	}
+
+	return true;
+}
+
 static void command_generic_event_alt(uint16_t index, uint16_t length,
 							const void *param,
 							void *user_data)
 {
 	struct test_data *data = tester_get_data();
 	const struct generic_data *test = data->test_data;
+	bool (*verify)(const void *param, uint16_t length);
 
-	if (length != test->expect_alt_ev_len) {
-		tester_warn("Invalid length %s event",
+	tester_print("New %s event received", mgmt_evstr(test->expect_alt_ev));
+
+	mgmt_unregister(data->mgmt_alt, data->mgmt_alt_ev_id);
+
+	if (test->verify_alt_ev_func)
+		verify = test->verify_alt_ev_func;
+	else
+		verify = verify_alt_ev;
+
+	if (!verify(param, length)) {
+		tester_warn("Incorrect %s event parameters",
 					mgmt_evstr(test->expect_alt_ev));
 		tester_test_failed();
 		return;
 	}
-
-	tester_print("New %s event received", mgmt_evstr(test->expect_alt_ev));
-
-	if (test->expect_alt_ev_param &&
-			memcmp(param, test->expect_alt_ev_param,
-						test->expect_alt_ev_len) != 0)
-		return;
-
-	tester_print("Unregistering %s notification",
-					mgmt_evstr(test->expect_alt_ev));
-
-	mgmt_unregister(data->mgmt_alt, data->mgmt_alt_ev_id);
 
 	test_condition_complete(data);
 }
@@ -4521,6 +4696,15 @@ int main(int argc, char *argv[])
 	test_bredrle("Pair Device - SSP Non-bondable 1",
 				&pair_device_ssp_nonbondable_1,
 				NULL, test_command_generic);
+	test_le("Pair Device - LE Success 1",
+				&pair_device_le_success_test_1,
+				NULL, test_command_generic);
+	test_le("Pair Device - LE Success 2",
+				&pair_device_le_success_test_2,
+				NULL, test_command_generic);
+	test_le("Pair Device - LE Reject 1",
+				&pair_device_le_reject_test_1,
+				NULL, test_command_generic);
 
 	test_bredrle("Pairing Acceptor - Legacy 1",
 				&pairing_acceptor_legacy_1, NULL,
@@ -4538,16 +4722,31 @@ int main(int argc, char *argv[])
 				&pairing_acceptor_linksec_2, NULL,
 				test_pairing_acceptor);
 	test_bredrle("Pairing Acceptor - SSP 1",
-				&pairing_acceptor_ssp_1, setup_ssp_acceptor,
+				&pairing_acceptor_ssp_1, setup_pairing_acceptor,
 				test_pairing_acceptor);
 	test_bredrle("Pairing Acceptor - SSP 2",
-				&pairing_acceptor_ssp_2, setup_ssp_acceptor,
+				&pairing_acceptor_ssp_2, setup_pairing_acceptor,
 				test_pairing_acceptor);
 	test_bredrle("Pairing Acceptor - SSP 3",
-				&pairing_acceptor_ssp_3, setup_ssp_acceptor,
+				&pairing_acceptor_ssp_3, setup_pairing_acceptor,
 				test_pairing_acceptor);
 	test_bredrle("Pairing Acceptor - SSP 4",
-				&pairing_acceptor_ssp_4, setup_ssp_acceptor,
+				&pairing_acceptor_ssp_4, setup_pairing_acceptor,
+				test_pairing_acceptor);
+	test_le("Pairing Acceptor - LE 1",
+				&pairing_acceptor_le_1, setup_pairing_acceptor,
+				test_pairing_acceptor);
+	test_le("Pairing Acceptor - LE 2",
+				&pairing_acceptor_le_2, setup_pairing_acceptor,
+				test_pairing_acceptor);
+	test_le("Pairing Acceptor - LE 3",
+				&pairing_acceptor_le_3, setup_pairing_acceptor,
+				test_pairing_acceptor);
+	test_le("Pairing Acceptor - LE 4",
+				&pairing_acceptor_le_4, setup_pairing_acceptor,
+				test_pairing_acceptor);
+	test_le("Pairing Acceptor - LE 5",
+				&pairing_acceptor_le_5, setup_pairing_acceptor,
 				test_pairing_acceptor);
 
 	test_bredrle("Unpair Device - Not Powered 1",

@@ -42,7 +42,6 @@
 #include "src/sdpd.h"
 #include "btio/btio.h"
 
-#include "mcap_lib.h"
 #include "hdp_types.h"
 #include "hdp_util.h"
 #include "hdp.h"
@@ -81,7 +80,7 @@ struct hdp_tmp_dc_data {
 struct hdp_echo_data {
 	gboolean		echo_done;	/* Is a echo was already done */
 	gpointer		buf;		/* echo packet sent */
-	uint			tid;		/* echo timeout */
+	guint			tid;		/* echo timeout */
 };
 
 static struct hdp_channel *hdp_channel_ref(struct hdp_channel *chan)

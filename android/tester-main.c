@@ -16,6 +16,7 @@
  */
 #include <stdbool.h>
 
+#include "src/shared/util.h"
 #include "emulator/bthost.h"
 #include "tester-main.h"
 
@@ -27,6 +28,79 @@ static gint scheduled_cbacks_num;
 
 #define EMULATOR_SIGNAL_TIMEOUT 2 /* in seconds */
 #define EMULATOR_SIGNAL "emulator_started"
+
+static struct {
+	uint16_t cb_num;
+	const char *str;
+} cb_table[] = {
+	DBG_CB(CB_BT_ADAPTER_STATE_CHANGED),
+	DBG_CB(CB_BT_ADAPTER_PROPERTIES),
+	DBG_CB(CB_BT_REMOTE_DEVICE_PROPERTIES),
+	DBG_CB(CB_BT_DEVICE_FOUND),
+	DBG_CB(CB_BT_DISCOVERY_STATE_CHANGED),
+	DBG_CB(CB_BT_PIN_REQUEST),
+	DBG_CB(CB_BT_SSP_REQUEST),
+	DBG_CB(CB_BT_BOND_STATE_CHANGED),
+	DBG_CB(CB_BT_ACL_STATE_CHANGED),
+	DBG_CB(CB_BT_THREAD_EVT),
+	DBG_CB(CB_BT_DUT_MODE_RECV),
+	DBG_CB(CB_BT_LE_TEST_MODE),
+
+	/* Hidhost cb */
+	DBG_CB(CB_HH_CONNECTION_STATE),
+	DBG_CB(CB_HH_HID_INFO),
+	DBG_CB(CB_HH_PROTOCOL_MODE),
+	DBG_CB(CB_HH_IDLE_TIME),
+	DBG_CB(CB_HH_GET_REPORT),
+	DBG_CB(CB_HH_VIRTUAL_UNPLUG),
+
+	/* PAN cb */
+	DBG_CB(CB_PAN_CONTROL_STATE),
+	DBG_CB(CB_PAN_CONNECTION_STATE),
+
+	/* HDP cb */
+	DBG_CB(CB_HDP_APP_REG_STATE),
+	DBG_CB(CB_HDP_CHANNEL_STATE),
+
+	/* A2DP cb */
+	DBG_CB(CB_A2DP_CONN_STATE),
+	DBG_CB(CB_A2DP_AUDIO_STATE),
+
+	/* Gatt client */
+	DBG_CB(CB_GATTC_REGISTER_CLIENT),
+	DBG_CB(CB_GATTC_SCAN_RESULT),
+	DBG_CB(CB_GATTC_OPEN),
+	DBG_CB(CB_GATTC_CLOSE),
+	DBG_CB(CB_GATTC_SEARCH_COMPLETE),
+	DBG_CB(CB_GATTC_SEARCH_RESULT),
+	DBG_CB(CB_GATTC_GET_CHARACTERISTIC),
+	DBG_CB(CB_GATTC_GET_DESCRIPTOR),
+	DBG_CB(CB_GATTC_GET_INCLUDED_SERVICE),
+	DBG_CB(CB_GATTC_REGISTER_FOR_NOTIFICATION),
+	DBG_CB(CB_GATTC_NOTIFY),
+	DBG_CB(CB_GATTC_READ_CHARACTERISTIC),
+	DBG_CB(CB_GATTC_WRITE_CHARACTERISTIC),
+	DBG_CB(CB_GATTC_READ_DESCRIPTOR),
+	DBG_CB(CB_GATTC_WRITE_DESCRIPTOR),
+	DBG_CB(CB_GATTC_EXECUTE_WRITE),
+	DBG_CB(CB_GATTC_READ_REMOTE_RSSI),
+	DBG_CB(CB_GATTC_LISTEN),
+
+	/* Gatt server */
+	DBG_CB(CB_GATTS_REGISTER_SERVER),
+	DBG_CB(CB_GATTS_CONNECTION),
+	DBG_CB(CB_GATTS_SERVICE_ADDED),
+	DBG_CB(CB_GATTS_INCLUDED_SERVICE_ADDED),
+	DBG_CB(CB_GATTS_CHARACTERISTIC_ADDED),
+	DBG_CB(CB_GATTS_DESCRIPTOR_ADDED),
+	DBG_CB(CB_GATTS_SERVICE_STARTED),
+	DBG_CB(CB_GATTS_SERVICE_STOPPED),
+	DBG_CB(CB_GATTS_SERVICE_DELETED),
+	DBG_CB(CB_GATTS_REQUEST_READ),
+	DBG_CB(CB_GATTS_REQUEST_WRITE),
+	DBG_CB(CB_GATTS_REQUEST_EXEC_WRITE),
+	DBG_CB(CB_GATTS_RESPONSE_CONFIRMATION),
+};
 
 static gboolean check_callbacks_called(gpointer user_data)
 {
@@ -402,6 +476,9 @@ static bool verify_gatt_ids(btgatt_gatt_id_t *a, btgatt_gatt_id_t *b)
 	if (memcmp(&a->uuid, &b->uuid, sizeof(bt_uuid_t)))
 		return false;
 
+	if (a->inst_id != b->inst_id)
+		return false;
+
 	return true;
 }
 
@@ -431,146 +508,230 @@ static bool match_data(struct step *step)
 		return false;
 	}
 
-	if (exp->callback || step->callback) {
-		if (exp->callback != step->callback) {
-			tester_debug("Callback type don't match");
-			return false;
-		}
+	if (!exp->callback && !step->callback)
+		return true;
 
-		if (exp->callback_result.state !=
-						step->callback_result.state) {
-			tester_debug("Callback state don't match");
-			return false;
-		}
+	if (exp->callback != step->callback) {
+		tester_debug("Callback type mismatch: %s vs %s",
+						cb_table[step->callback].str,
+						cb_table[exp->callback].str);
+		return false;
+	}
 
-		if (exp->callback_result.status !=
-						step->callback_result.status) {
-			tester_debug("Callback status don't match");
-			return false;
-		}
+	if (exp->callback_result.state != step->callback_result.state) {
+		tester_debug("Callback state mismatch: %d vs %d",
+						step->callback_result.state,
+						exp->callback_result.state);
+		return false;
+	}
 
-		if (exp->callback_result.mode !=
-						step->callback_result.mode) {
-			tester_debug("Callback mode don't match");
-			return false;
-		}
+	if (exp->callback_result.status != step->callback_result.status) {
+		tester_debug("Callback status mismatch: %d vs %d",
+						step->callback_result.status,
+						exp->callback_result.status);
+		return false;
+	}
 
-		if (exp->callback_result.report_size !=
+	if (exp->callback_result.mode != step->callback_result.mode) {
+		tester_debug("Callback mode mismatch: %02x vs %02x",
+						step->callback_result.mode,
+						exp->callback_result.mode);
+		return false;
+	}
+
+	if (exp->callback_result.report_size !=
 					step->callback_result.report_size) {
-			tester_debug("Callback report size don't match");
-			return false;
-		}
+		tester_debug("Callback report size mismatch: %d vs %d",
+					step->callback_result.report_size,
+					exp->callback_result.report_size);
+		return false;
+	}
 
-		if (exp->callback_result.ctrl_state !=
+	if (exp->callback_result.ctrl_state !=
 					step->callback_result.ctrl_state) {
-			tester_debug("Callback ctrl state don't match");
-			return false;
-		}
+		tester_debug("Callback ctrl state mismatch: %d vs %d",
+					step->callback_result.ctrl_state,
+					exp->callback_result.ctrl_state);
+		return false;
+	}
 
-		if (exp->callback_result.conn_state !=
+	if (exp->callback_result.conn_state !=
 					step->callback_result.conn_state) {
-			tester_debug("Callback connection state don't match");
-			return false;
-		}
+		tester_debug("Callback connection state mismatch: %d vs %d",
+					step->callback_result.conn_state,
+					exp->callback_result.conn_state);
+		return false;
+	}
 
-		if (exp->callback_result.local_role !=
+	if (exp->callback_result.local_role !=
 					step->callback_result.local_role) {
-			tester_debug("Callback local_role don't match");
-			return false;
-		}
+		tester_debug("Callback local_role mismatch: %d vs %d",
+					step->callback_result.local_role,
+					exp->callback_result.local_role);
+		return false;
+	}
 
-		if (exp->callback_result.remote_role !=
+	if (exp->callback_result.remote_role !=
 					step->callback_result.remote_role) {
-			tester_debug("Callback remote_role don't match");
-			return false;
-		}
+		tester_debug("Callback remote_role mismatch: %d vs %d",
+					step->callback_result.remote_role,
+					exp->callback_result.remote_role);
+		return false;
+	}
 
-		if (exp->callback_result.app_id !=
-					step->callback_result.app_id) {
-			tester_debug("Callback app_id don't match");
-			return false;
-		}
+	if (exp->callback_result.app_id != step->callback_result.app_id) {
+		tester_debug("Callback app_id mismatch: %d vs %d",
+						step->callback_result.app_id,
+						exp->callback_result.app_id);
+		return false;
+	}
 
-		if (exp->callback_result.channel_id !=
+	if (exp->callback_result.channel_id !=
 					step->callback_result.channel_id) {
-			tester_debug("Callback channel_id don't match");
-			return false;
-		}
+		tester_debug("Callback channel_id mismatch: %d vs %d",
+					step->callback_result.channel_id,
+					exp->callback_result.channel_id);
+		return false;
+	}
 
-		if (exp->callback_result.mdep_cfg_index !=
+	if (exp->callback_result.mdep_cfg_index !=
 					step->callback_result.mdep_cfg_index) {
-			tester_debug("Callback mdep_cfg_index don't match");
-			return false;
-		}
+		tester_debug("Callback mdep_cfg_index mismatch: %d vs %d",
+					step->callback_result.mdep_cfg_index,
+					exp->callback_result.mdep_cfg_index);
+		return false;
+	}
 
-		if (exp->callback_result.app_state !=
-					step->callback_result.app_state) {
-			tester_debug("Callback app_state don't match");
-			return false;
-		}
+	if (exp->callback_result.app_state != step->callback_result.app_state) {
+		tester_debug("Callback app_state mismatch: %d vs %d",
+						step->callback_result.app_state,
+						exp->callback_result.app_state);
+		return false;
+	}
 
-		if (exp->callback_result.channel_state !=
+	if (exp->callback_result.channel_state !=
 					step->callback_result.channel_state) {
-			tester_debug("Callback channel_state don't match");
-			return false;
-		}
+		tester_debug("Callback channel_state mismatch: %d vs %d",
+					step->callback_result.channel_state,
+					exp->callback_result.channel_state);
+		return false;
+	}
 
-		if (exp->callback_result.pairing_variant !=
+	if (exp->callback_result.pairing_variant !=
 					step->callback_result.pairing_variant) {
-			tester_debug("Callback pairing result don't match");
-			return false;
-		}
+		tester_debug("Callback pairing result mismatch: %d vs %d",
+					step->callback_result.pairing_variant,
+					exp->callback_result.pairing_variant);
+		return false;
+	}
 
-		if (exp->callback_result.adv_data !=
-					step->callback_result.adv_data) {
-			tester_debug("Callback adv. data status don't match");
-			return false;
-		}
+	if (exp->callback_result.adv_data != step->callback_result.adv_data) {
+		tester_debug("Callback adv. data status mismatch: %d vs %d",
+						step->callback_result.adv_data,
+						exp->callback_result.adv_data);
+		return false;
+	}
 
-		if (exp->callback_result.conn_id !=
-						step->callback_result.conn_id) {
-			tester_debug("Callback conn_id don't match");
-			return false;
-		}
+	if (exp->callback_result.conn_id != step->callback_result.conn_id) {
+		tester_debug("Callback conn_id mismatch: %d vs %d",
+						step->callback_result.conn_id,
+						exp->callback_result.conn_id);
+		return false;
+	}
 
-		if (exp->callback_result.client_id !=
-					step->callback_result.client_id) {
-				tester_debug("Callback client_id don't match");
-				return false;
-		}
+	if (exp->callback_result.gatt_app_id !=
+					step->callback_result.gatt_app_id) {
+		tester_debug("Callback gatt_app_id mismatch: %d vs %d",
+					step->callback_result.gatt_app_id,
+					exp->callback_result.gatt_app_id);
+		return false;
+	}
 
-		if (exp->callback_result.properties &&
-				verify_property(exp->callback_result.properties,
-				exp->callback_result.num_properties,
-				step->callback_result.properties,
-				step->callback_result.num_properties)) {
-			tester_debug("Gatt properties don't match");
-			return false;
-		}
+	if (exp->callback_result.properties &&
+			verify_property(exp->callback_result.properties,
+					exp->callback_result.num_properties,
+					step->callback_result.properties,
+					step->callback_result.num_properties)) {
+		tester_debug("Gatt properties don't match");
+		return false;
+	}
 
-		if (exp->callback_result.service &&
-				!verify_services(step->callback_result.service,
+	if (exp->callback_result.service &&
+			!verify_services(step->callback_result.service,
 						exp->callback_result.service)) {
-			tester_debug("Gatt service doesn't match");
+		tester_debug("Gatt service doesn't match");
+		return false;
+	}
+
+	if (exp->callback_result.characteristic) {
+		btgatt_gatt_id_t *a;
+		btgatt_gatt_id_t *b;
+		a = step->callback_result.characteristic;
+		b = exp->callback_result.characteristic;
+
+		if (!verify_gatt_ids(a, b)) {
+			tester_debug("Gatt char doesn't match");
+			return false;
+		}
+	}
+
+	if (exp->callback_result.char_prop != step->callback_result.char_prop) {
+		tester_debug("Gatt char prop mismatch: %d vs %d",
+						step->callback_result.char_prop,
+						exp->callback_result.char_prop);
+		return false;
+	}
+
+	if (exp->callback_result.descriptor) {
+		btgatt_gatt_id_t *a;
+		btgatt_gatt_id_t *b;
+		a = step->callback_result.descriptor;
+		b = exp->callback_result.descriptor;
+
+		if (!verify_gatt_ids(a, b)) {
+			tester_debug("Gatt desc doesn't match");
+			return false;
+		}
+	}
+
+	if (exp->callback_result.included) {
+		if (!verify_services(step->callback_result.included,
+					exp->callback_result.included)) {
+			tester_debug("Gatt include srvc doesn't match");
+			return false;
+		}
+	}
+
+	if (exp->callback_result.read_params) {
+		if (memcmp(step->callback_result.read_params,
+				exp->callback_result.read_params,
+				sizeof(btgatt_read_params_t))) {
+			tester_debug("Gatt read_param doesn't match");
+			return false;
+		}
+	}
+
+	if (exp->callback_result.write_params) {
+		if (memcmp(step->callback_result.write_params,
+				exp->callback_result.write_params,
+				sizeof(btgatt_write_params_t))) {
+			tester_debug("Gatt write_param doesn't match");
 			return false;
 		}
 
-		if (exp->callback_result.characteristic) {
-			btgatt_gatt_id_t *a;
-			btgatt_gatt_id_t *b;
-			a = step->callback_result.characteristic;
-			b = exp->callback_result.characteristic;
+		if (exp->callback_result.notification_registered !=
+				step->callback_result.notification_registered) {
+			tester_debug("Gatt registered flag mismatch");
+			return false;
+		}
 
-			if (!verify_gatt_ids(a, b)) {
-				tester_debug("Gatt char doesn't match");
+		if (exp->callback_result.notify_params) {
+			if (memcmp(step->callback_result.notify_params,
+					exp->callback_result.notify_params,
+					sizeof(btgatt_notify_params_t))) {
+				tester_debug("Gatt notify_param doesn't match");
 				return false;
 			}
-		}
-
-		if (exp->callback_result.char_prop !=
-					step->callback_result.char_prop) {
-			tester_debug("Gatt char prop doesn't match");
-			return false;
 		}
 	}
 
@@ -661,6 +822,21 @@ static void destroy_callback_step(void *data)
 
 	if (step->callback_result.characteristic)
 		free(step->callback_result.characteristic);
+
+	if (step->callback_result.descriptor)
+		free(step->callback_result.descriptor);
+
+	if (step->callback_result.included)
+		free(step->callback_result.included);
+
+	if (step->callback_result.read_params)
+		free(step->callback_result.read_params);
+
+	if (step->callback_result.write_params)
+		free(step->callback_result.write_params);
+
+	if (step->callback_result.notify_params)
+		free(step->callback_result.notify_params);
 
 	g_free(step);
 	g_atomic_int_dec_and_test(&scheduled_cbacks_num);
@@ -821,8 +997,8 @@ static void bond_state_changed_cb(bt_status_t status,
 
 	/* Utilize property verification mechanism for bdaddr */
 	step->callback_result.num_properties = 1;
-	step->callback_result.properties = create_property(BT_PROPERTY_BDADDR,
-						remote_bd_addr,
+	step->callback_result.properties =
+			create_property(BT_PROPERTY_BDADDR, remote_bd_addr,
 						sizeof(*remote_bd_addr));
 
 	step->callback = CB_BT_BOND_STATE_CHANGED;
@@ -1032,7 +1208,7 @@ static void gattc_connect_cb(int conn_id, int status, int client_if,
 	step->callback = CB_GATTC_OPEN;
 	step->callback_result.status = status;
 	step->callback_result.conn_id = conn_id;
-	step->callback_result.client_id = client_if;
+	step->callback_result.gatt_app_id = client_if;
 
 	/* Utilize property verification mechanism for bdaddr */
 	props[0] = create_property(BT_PROPERTY_BDADDR, bda, sizeof(*bda));
@@ -1055,7 +1231,7 @@ static void gattc_disconnect_cb(int conn_id, int status, int client_if,
 	step->callback = CB_GATTC_CLOSE;
 	step->callback_result.status = status;
 	step->callback_result.conn_id = conn_id;
-	step->callback_result.client_id = client_if;
+	step->callback_result.gatt_app_id = client_if;
 
 	/* Utilize property verification mechanism for bdaddr */
 	props[0] = create_property(BT_PROPERTY_BDADDR, bda, sizeof(*bda));
@@ -1113,6 +1289,132 @@ static void gattc_get_characteristic_cb(int conn_id, int status,
 	step->callback_result.characteristic = g_memdup(char_id,
 							sizeof(*char_id));
 	step->callback_result.char_prop = char_prop;
+
+	schedule_callback_call(step);
+}
+
+static void gattc_get_descriptor_cb(int conn_id, int status,
+			btgatt_srvc_id_t *srvc_id, btgatt_gatt_id_t *char_id,
+			btgatt_gatt_id_t *descr_id)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_GET_DESCRIPTOR;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.service = g_memdup(srvc_id, sizeof(*srvc_id));
+	step->callback_result.characteristic = g_memdup(char_id,
+							sizeof(*char_id));
+	step->callback_result.descriptor = g_memdup(descr_id,
+							sizeof(*descr_id));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_get_included_service_cb(int conn_id, int status,
+		btgatt_srvc_id_t *srvc_id, btgatt_srvc_id_t *incl_srvc_id)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_GET_INCLUDED_SERVICE;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.service = g_memdup(srvc_id, sizeof(*srvc_id));
+	step->callback_result.included = g_memdup(incl_srvc_id,
+							sizeof(*srvc_id));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_read_characteristic_cb(int conn_id, int status,
+						btgatt_read_params_t *p_data)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_READ_CHARACTERISTIC;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.read_params = g_memdup(p_data, sizeof(*p_data));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_read_descriptor_cb(int conn_id, int status,
+						btgatt_read_params_t *p_data)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_READ_DESCRIPTOR;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.read_params = g_memdup(p_data, sizeof(*p_data));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_write_characteristic_cb(int conn_id, int status,
+						btgatt_write_params_t *p_data)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_WRITE_CHARACTERISTIC;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.write_params = g_memdup(p_data, sizeof(*p_data));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_write_descriptor_cb(int conn_id, int status,
+						btgatt_write_params_t *p_data)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_WRITE_DESCRIPTOR;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.write_params = g_memdup(p_data, sizeof(*p_data));
+
+	schedule_callback_call(step);
+}
+
+static void gattc_register_for_notification_cb(int conn_id, int registered,
+						int status,
+						btgatt_srvc_id_t *srvc_id,
+						btgatt_gatt_id_t *char_id)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_REGISTER_FOR_NOTIFICATION;
+	step->callback_result.status = status;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.service = g_memdup(srvc_id, sizeof(*srvc_id));
+	step->callback_result.characteristic = g_memdup(char_id,
+							sizeof(*char_id));
+	step->callback_result.notification_registered = registered;
+
+	schedule_callback_call(step);
+}
+
+static void gattc_notif_cb(int conn_id, btgatt_notify_params_t *p_data)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTC_NOTIFY;
+	step->callback_result.conn_id = conn_id;
+	step->callback_result.notify_params = g_memdup(p_data, sizeof(*p_data));
+
+	schedule_callback_call(step);
+}
+
+static void gatts_register_server_cb(int status, int server_if,
+							bt_uuid_t *app_uuid)
+{
+	struct step *step = g_new0(struct step, 1);
+
+	step->callback = CB_GATTS_REGISTER_SERVER;
+
+	step->callback_result.status = status;
 
 	schedule_callback_call(step);
 }
@@ -1224,21 +1526,21 @@ static const btgatt_client_callbacks_t btgatt_client_callbacks = {
 	.search_complete_cb = gattc_search_complete_cb,
 	.search_result_cb = gattc_search_result_cb,
 	.get_characteristic_cb = gattc_get_characteristic_cb,
-	.get_descriptor_cb = NULL,
-	.get_included_service_cb = NULL,
-	.register_for_notification_cb = NULL,
-	.notify_cb = NULL,
-	.read_characteristic_cb = NULL,
-	.write_characteristic_cb = NULL,
-	.read_descriptor_cb = NULL,
-	.write_descriptor_cb = NULL,
+	.get_descriptor_cb = gattc_get_descriptor_cb,
+	.get_included_service_cb = gattc_get_included_service_cb,
+	.register_for_notification_cb = gattc_register_for_notification_cb,
+	.notify_cb = gattc_notif_cb,
+	.read_characteristic_cb = gattc_read_characteristic_cb,
+	.write_characteristic_cb = gattc_write_characteristic_cb,
+	.read_descriptor_cb = gattc_read_descriptor_cb,
+	.write_descriptor_cb = gattc_write_descriptor_cb,
 	.execute_write_cb = NULL,
 	.read_remote_rssi_cb = NULL,
 	.listen_cb = gattc_listen_cb
 };
 
 static const btgatt_server_callbacks_t btgatt_server_callbacks = {
-	.register_server_cb = NULL,
+	.register_server_cb = gatts_register_server_cb,
 	.connection_cb = NULL,
 	.service_added_cb = NULL,
 	.included_service_added_cb = NULL,
@@ -1569,7 +1871,7 @@ static void setup_avrcp(const void *test_data)
 	}
 
 	avrcp = if_bt->get_profile_interface(BT_PROFILE_AV_RC_ID);
-	if (!a2dp) {
+	if (!avrcp) {
 		tester_setup_failed();
 		return;
 	}
@@ -1871,6 +2173,76 @@ void emu_add_l2cap_server_action(void)
 	step->action_status = BT_STATUS_SUCCESS;
 
 	schedule_action_verification(step);
+}
+
+static void print_data(const char *str, void *user_data)
+{
+	tester_debug("tester: %s", str);
+}
+
+static void emu_generic_cid_hook_cb(const void *data, uint16_t len,
+								void *user_data)
+{
+	struct test_data *t_data = tester_get_data();
+	struct emu_l2cap_cid_data *cid_data = user_data;
+	const struct pdu_set *pdus = cid_data->pdu;
+	struct bthost *bthost = hciemu_client_get_host(t_data->hciemu);
+	int i;
+
+	for (i = 0; pdus[i].rsp.iov_base; i++) {
+		if (pdus[i].req.iov_base) {
+			if (pdus[i].req.iov_len != len)
+				continue;
+
+			if (memcmp(pdus[i].req.iov_base, data, len))
+				continue;
+		}
+
+		if (pdus[i].rsp.iov_base) {
+			util_hexdump('>', pdus[i].rsp.iov_base,
+					pdus[i].rsp.iov_len, print_data, NULL);
+
+			/* if its sdp pdu use transaction ID from request */
+			if (cid_data->is_sdp) {
+				struct iovec rsp[3];
+
+				rsp[0].iov_base = pdus[i].rsp.iov_base;
+				rsp[0].iov_len = 1;
+
+				rsp[1].iov_base = ((uint8_t *) data) + 1;
+				rsp[1].iov_len = 2;
+
+				rsp[2].iov_base = pdus[i].rsp.iov_base + 3;
+				rsp[2].iov_len = pdus[i].rsp.iov_len - 3;
+
+				bthost_send_cid_v(bthost, cid_data->handle,
+							cid_data->cid, rsp, 3);
+			} else {
+				bthost_send_cid_v(bthost, cid_data->handle,
+						cid_data->cid, &pdus[i].rsp, 1);
+			}
+
+		}
+	}
+}
+
+void tester_handle_l2cap_data_exchange(struct emu_l2cap_cid_data *cid_data)
+{
+	struct test_data *t_data = tester_get_data();
+	struct bthost *bthost = hciemu_client_get_host(t_data->hciemu);
+
+	bthost_add_cid_hook(bthost, cid_data->handle, cid_data->cid,
+					emu_generic_cid_hook_cb, cid_data);
+}
+
+void tester_generic_connect_cb(uint16_t handle, uint16_t cid, void *user_data)
+{
+	struct emu_l2cap_cid_data *cid_data = user_data;
+
+	cid_data->handle = handle;
+	cid_data->cid = cid;
+
+	tester_handle_l2cap_data_exchange(cid_data);
 }
 
 static void rfcomm_connect_cb(uint16_t handle, uint16_t cid, void *user_data,

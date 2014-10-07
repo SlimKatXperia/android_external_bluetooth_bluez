@@ -93,6 +93,8 @@ static void gatt_debug_cb(const char *str, void *user_data)
 }
 
 static void ready_cb(bool success, uint8_t att_ecode, void *user_data);
+static void service_changed_cb(uint16_t start_handle, uint16_t end_handle,
+							void *user_data);
 
 static struct client *client_create(int fd, uint16_t mtu)
 {
@@ -143,6 +145,8 @@ static struct client *client_create(int fd, uint16_t mtu)
 	}
 
 	bt_gatt_client_set_ready_handler(cli->gatt, ready_cb, cli, NULL);
+	bt_gatt_client_set_service_changed(cli->gatt, service_changed_cb, cli,
+									NULL);
 
 	/* bt_gatt_client already holds a reference */
 	bt_att_unref(att);
@@ -169,16 +173,21 @@ static void print_uuid(const uint8_t uuid[16])
 
 static void print_service(const bt_gatt_service_t *service)
 {
+	struct bt_gatt_characteristic_iter iter;
 	const bt_gatt_characteristic_t *chrc;
-	size_t i, j;
+	size_t i;
+
+	if (!bt_gatt_characteristic_iter_init(&iter, service)) {
+		PRLOG("Failed to initialize characteristic iterator\n");
+		return;
+	}
 
 	printf(COLOR_RED "service" COLOR_OFF " - start: 0x%04x, "
 				"end: 0x%04x, uuid: ",
 				service->start_handle, service->end_handle);
 	print_uuid(service->uuid);
 
-	for (i = 0; i < service->num_chrcs; i++) {
-		chrc = service->chrcs + i;
+	while (bt_gatt_characteristic_iter_next(&iter, &chrc)) {
 		printf("\t  " COLOR_YELLOW "charac" COLOR_OFF
 				" - start: 0x%04x, end: 0x%04x, "
 				"value: 0x%04x, props: 0x%02x, uuid: ",
@@ -186,13 +195,13 @@ static void print_service(const bt_gatt_service_t *service)
 				chrc->end_handle,
 				chrc->value_handle,
 				chrc->properties);
-		print_uuid(service->chrcs[i].uuid);
+		print_uuid(chrc->uuid);
 
-		for (j = 0; j < chrc->num_descs; j++) {
+		for (i = 0; i < chrc->num_descs; i++) {
 			printf("\t\t  " COLOR_MAGENTA "descr" COLOR_OFF
 						" - handle: 0x%04x, uuid: ",
-						chrc->descs[j].handle);
-			print_uuid(chrc->descs[j].uuid);
+						chrc->descs[i].handle);
+			print_uuid(chrc->descs[i].uuid);
 		}
 	}
 
@@ -202,7 +211,7 @@ static void print_service(const bt_gatt_service_t *service)
 static void print_services(struct client *cli)
 {
 	struct bt_gatt_service_iter iter;
-	bt_gatt_service_t service;
+	const bt_gatt_service_t *service;
 
 	if (!bt_gatt_service_iter_init(&iter, cli->gatt)) {
 		PRLOG("Failed to initialize service iterator\n");
@@ -212,13 +221,13 @@ static void print_services(struct client *cli)
 	printf("\n");
 
 	while (bt_gatt_service_iter_next(&iter, &service))
-		print_service(&service);
+		print_service(service);
 }
 
 static void print_services_by_uuid(struct client *cli, const bt_uuid_t *uuid)
 {
 	struct bt_gatt_service_iter iter;
-	bt_gatt_service_t service;
+	const bt_gatt_service_t *service;
 
 	if (!bt_gatt_service_iter_init(&iter, cli->gatt)) {
 		PRLOG("Failed to initialize service iterator\n");
@@ -229,13 +238,13 @@ static void print_services_by_uuid(struct client *cli, const bt_uuid_t *uuid)
 
 	while (bt_gatt_service_iter_next_by_uuid(&iter, uuid->value.u128.data,
 								&service))
-		print_service(&service);
+		print_service(service);
 }
 
 static void print_services_by_handle(struct client *cli, uint16_t handle)
 {
 	struct bt_gatt_service_iter iter;
-	bt_gatt_service_t service;
+	const bt_gatt_service_t *service;
 
 	if (!bt_gatt_service_iter_init(&iter, cli->gatt)) {
 		PRLOG("Failed to initialize service iterator\n");
@@ -245,7 +254,7 @@ static void print_services_by_handle(struct client *cli, uint16_t handle)
 	printf("\n");
 
 	while (bt_gatt_service_iter_next_by_handle(&iter, handle, &service))
-		print_service(&service);
+		print_service(service);
 }
 
 static void ready_cb(bool success, uint8_t att_ecode, void *user_data)
@@ -261,6 +270,36 @@ static void ready_cb(bool success, uint8_t att_ecode, void *user_data)
 	PRLOG("GATT discovery procedures complete\n");
 
 	print_services(cli);
+	print_prompt();
+}
+
+static void service_changed_cb(uint16_t start_handle, uint16_t end_handle,
+								void *user_data)
+{
+	struct client *cli = user_data;
+	struct bt_gatt_service_iter iter;
+	const bt_gatt_service_t *service;
+
+	if (!bt_gatt_service_iter_init(&iter, cli->gatt)) {
+		PRLOG("Failed to initialize service iterator\n");
+		return;
+	}
+
+	printf("\nService Changed handled - start: 0x%04x end: 0x%04x\n",
+						start_handle, end_handle);
+
+	if (!bt_gatt_service_iter_next_by_handle(&iter, start_handle, &service))
+		return;
+
+	print_service(service);
+
+	while (bt_gatt_service_iter_next(&iter, &service)) {
+		if (service->start_handle >= end_handle)
+			break;
+
+		print_service(service);
+	}
+
 	print_prompt();
 }
 
@@ -534,8 +573,7 @@ static void cmd_write_value(struct client *cli, char *cmd_str)
 			if (strlen(argv[i]) != 2) {
 				printf("Invalid value byte: %s\n",
 								argv[i]);
-				free(value);
-				return;
+				goto done;
 			}
 
 			value[i-1] = strtol(argv[i], &endptr, 16);
@@ -543,8 +581,7 @@ static void cmd_write_value(struct client *cli, char *cmd_str)
 							|| errno == ERANGE) {
 				printf("Invalid value byte: %s\n",
 								argv[i]);
-				free(value);
-				return;
+				goto done;
 			}
 		}
 	}
@@ -554,11 +591,11 @@ static void cmd_write_value(struct client *cli, char *cmd_str)
 							false, value, length)) {
 			printf("Failed to initiate write without response "
 								"procedure\n");
-			return;
+			goto done;
 		}
 
 		printf("Write command sent\n");
-		return;
+		goto done;
 	}
 
 	if (!bt_gatt_client_write_value(cli->gatt, handle, value, length,
@@ -566,6 +603,7 @@ static void cmd_write_value(struct client *cli, char *cmd_str)
 								NULL, NULL))
 		printf("Failed to initiate write procedure\n");
 
+done:
 	free(value);
 }
 
@@ -697,6 +735,110 @@ static void cmd_write_long_value(struct client *cli, char *cmd_str)
 	free(value);
 }
 
+static void register_notify_usage(void)
+{
+	printf("Usage: register-notify <chrc value handle>\n");
+}
+
+static void notify_cb(uint16_t value_handle, const uint8_t *value,
+					uint16_t length, void *user_data)
+{
+	int i;
+
+	printf("\n\tHandle Value Not/Ind: 0x%04x - ", value_handle);
+
+	if (length == 0) {
+		PRLOG("(0 bytes)\n");
+		return;
+	}
+
+	printf("(%u bytes): ", length);
+
+	for (i = 0; i < length; i++)
+		printf("%02x ", value[i]);
+
+	PRLOG("\n");
+}
+
+static void register_notify_cb(unsigned int id, uint16_t att_ecode,
+								void *user_data)
+{
+	if (!id) {
+		PRLOG("Failed to register notify handler "
+					"- error code: 0x%02x\n", att_ecode);
+		return;
+	}
+
+	PRLOG("Registered notify handler with id: %u\n", id);
+}
+
+static void cmd_register_notify(struct client *cli, char *cmd_str)
+{
+	char *argv[2];
+	int argc = 0;
+	uint16_t value_handle;
+	char *endptr = NULL;
+
+	if (!bt_gatt_client_is_ready(cli->gatt)) {
+		printf("GATT client not initialized\n");
+		return;
+	}
+
+	if (!parse_args(cmd_str, 1, argv, &argc) || argc != 1) {
+		register_notify_usage();
+		return;
+	}
+
+	value_handle = strtol(argv[0], &endptr, 16);
+	if (!endptr || *endptr != '\0' || !value_handle) {
+		printf("Invalid value handle: %s\n", argv[0]);
+		return;
+	}
+
+	if (!bt_gatt_client_register_notify(cli->gatt, value_handle,
+							register_notify_cb,
+							notify_cb, NULL, NULL))
+		printf("Failed to register notify handler\n");
+
+	printf("\n");
+}
+
+static void unregister_notify_usage(void)
+{
+	printf("Usage: unregister-notify <notify id>\n");
+}
+
+static void cmd_unregister_notify(struct client *cli, char *cmd_str)
+{
+	char *argv[2];
+	int argc = 0;
+	unsigned int id;
+	char *endptr = NULL;
+
+	if (!bt_gatt_client_is_ready(cli->gatt)) {
+		printf("GATT client not initialized\n");
+		return;
+	}
+
+	if (!parse_args(cmd_str, 1, argv, &argc) || argc != 1) {
+		unregister_notify_usage();
+		return;
+	}
+
+	id = strtol(argv[0], &endptr, 10);
+	if (!endptr || *endptr != '\0' || !id) {
+		printf("Invalid notify id: %s\n", argv[0]);
+		return;
+	}
+
+	if (!bt_gatt_client_unregister_notify(cli->gatt, id)) {
+		printf("Failed to unregister notify handler with id: %u\n", id);
+		return;
+	}
+
+	printf("Unregistered notify handler with id: %u\n", id);
+}
+
 static void cmd_help(struct client *cli, char *cmd_str);
 
 typedef void (*command_func_t)(struct client *cli, char *cmd_str);
@@ -716,6 +858,10 @@ static struct {
 			"\tWrite a characteristic or descriptor value" },
 	{ "write-long-value", cmd_write_long_value,
 			"Write long characteristic or descriptor value" },
+	{ "register-notify", cmd_register_notify,
+			"\tSubscribe to not/ind from a characteristic" },
+	{ "unregister-notify", cmd_unregister_notify,
+						"Unregister a not/ind session"},
 	{ }
 };
 

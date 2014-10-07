@@ -38,9 +38,9 @@
 #include "lib/mgmt.h"
 
 #include "src/shared/tester.h"
-#include "src/shared/hciemu.h"
 #include "src/shared/mgmt.h"
 #include "src/shared/queue.h"
+#include "emulator/hciemu.h"
 
 #include <hardware/hardware.h>
 #include <hardware/audio.h>
@@ -54,6 +54,21 @@
 #include <hardware/bt_gatt.h>
 #include <hardware/bt_gatt_client.h>
 #include <hardware/bt_gatt_server.h>
+
+struct pdu_set {
+	struct iovec req;
+	struct iovec rsp;
+};
+
+#define raw_data(args...) ((unsigned char[]) { args })
+
+#define raw_pdu(args...)					\
+	{							\
+		.iov_base = raw_data(args),			\
+		.iov_len = sizeof(raw_data(args)),		\
+	}
+
+#define end_pdu { .iov_base = NULL }
 
 #define TEST_CASE_BREDR(text, ...) { \
 		HCIEMU_TYPE_BREDR, \
@@ -132,7 +147,7 @@
 		.callback_result.properties = cb_prop, \
 		.callback_result.num_properties = 1, \
 		.callback_result.conn_id = cb_conn_id, \
-		.callback_result.client_id = cb_client_id, \
+		.callback_result.gatt_app_id = cb_client_id, \
 	}
 
 #define CALLBACK_GATTC_SEARCH_RESULT(cb_conn_id, cb_service) { \
@@ -155,13 +170,77 @@
 		.callback_result.char_prop = cb_char_prop \
 	}
 
+#define CALLBACK_GATTC_GET_DESCRIPTOR(cb_res, cb_conn_id, cb_service, \
+						cb_char, cb_desc) { \
+		.callback = CB_GATTC_GET_DESCRIPTOR, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.service = cb_service, \
+		.callback_result.characteristic = cb_char, \
+		.callback_result.descriptor = cb_desc \
+	}
+
+#define CALLBACK_GATTC_GET_INCLUDED(cb_res, cb_conn_id, cb_service, \
+							cb_incl) { \
+		.callback = CB_GATTC_GET_INCLUDED_SERVICE, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.service = cb_service, \
+		.callback_result.included = cb_incl, \
+	}
+
+#define CALLBACK_GATTC_READ_CHARACTERISTIC(cb_res, cb_conn_id, cb_read_data) { \
+		.callback = CB_GATTC_READ_CHARACTERISTIC, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.read_params = cb_read_data, \
+	}
+
+#define CALLBACK_GATTC_READ_DESCRIPTOR(cb_res, cb_conn_id, cb_read_data) { \
+		.callback = CB_GATTC_READ_DESCRIPTOR, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.read_params = cb_read_data, \
+	}
+
+#define CALLBACK_GATTC_WRITE_DESCRIPTOR(cb_res, cb_conn_id, cb_write_data) { \
+		.callback = CB_GATTC_WRITE_DESCRIPTOR, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.write_params = cb_write_data, \
+	}
+
+#define CALLBACK_GATTC_WRITE_CHARACTERISTIC(cb_res, cb_conn_id, \
+							cb_write_data) { \
+		.callback = CB_GATTC_WRITE_CHARACTERISTIC, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.write_params = cb_write_data, \
+	}
+
+#define CALLBACK_GATTC_REGISTER_FOR_NOTIF(cb_res, cb_conn_id, cb_char,\
+						cb_service, cb_registered) { \
+		.callback = CB_GATTC_REGISTER_FOR_NOTIFICATION, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.status = cb_res, \
+		.callback_result.service = cb_service, \
+		.callback_result.characteristic = cb_char, \
+		.callback_result.notification_registered = cb_registered \
+	}
+
+#define CALLBACK_GATTC_NOTIFY(cb_conn_id, cb_notify) { \
+		.callback = CB_GATTC_NOTIFY, \
+		.callback_result.conn_id = cb_conn_id, \
+		.callback_result.notify_params = cb_notify \
+	}
+
 #define CALLBACK_GATTC_DISCONNECT(cb_res, cb_prop, cb_conn_id, cb_client_id) { \
 		.callback = CB_GATTC_CLOSE, \
 		.callback_result.status = cb_res, \
 		.callback_result.properties = cb_prop, \
 		.callback_result.num_properties = 1, \
 		.callback_result.conn_id = cb_conn_id, \
-		.callback_result.client_id = cb_client_id, \
+		.callback_result.gatt_app_id = cb_client_id, \
 	}
 
 #define CALLBACK_PAN_CTRL_STATE(cb, cb_res, cb_state, cb_local_role) { \
@@ -232,6 +311,8 @@
 		.callback_result.properties = props, \
 		.callback_result.num_properties = prop_cnt, \
 	}
+
+#define DBG_CB(cb) { cb, #cb }
 
 /*
  * NOTICE:
@@ -374,6 +455,14 @@ struct emu_set_l2cap_data {
 	void *user_data;
 };
 
+struct emu_l2cap_cid_data {
+	const struct pdu_set *pdu;
+
+	uint16_t handle;
+	uint16_t cid;
+	bool is_sdp;
+};
+
 /*
  * Callback data structure should be enhanced with data
  * returned by callbacks. It's used for test case step
@@ -392,10 +481,16 @@ struct bt_callback_data {
 
 	bool adv_data;
 
-	int client_id;
+	int gatt_app_id;
 	int conn_id;
 	btgatt_srvc_id_t *service;
 	btgatt_gatt_id_t *characteristic;
+	btgatt_gatt_id_t *descriptor;
+	btgatt_srvc_id_t *included;
+	btgatt_read_params_t *read_params;
+	btgatt_write_params_t *write_params;
+	btgatt_notify_params_t *notify_params;
+	int notification_registered;
 	int char_prop;
 
 	btpan_control_state_t ctrl_state;
@@ -431,6 +526,9 @@ struct test_case {
 	const uint16_t step_num;
 	const struct step *step;
 };
+
+void tester_handle_l2cap_data_exchange(struct emu_l2cap_cid_data *cid_data);
+void tester_generic_connect_cb(uint16_t handle, uint16_t cid, void *user_data);
 
 /* Get, remove test cases API */
 struct queue *get_bluetooth_tests(void);

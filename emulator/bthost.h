@@ -23,8 +23,9 @@
  */
 
 #include <stdint.h>
+#include <sys/uio.h>
 
-typedef void (*bthost_send_func) (const void *data, uint16_t len,
+typedef void (*bthost_send_func) (const struct iovec *iov, int iovlen,
 							void *user_data);
 
 struct bthost;
@@ -63,6 +64,8 @@ void bthost_add_cid_hook(struct bthost *bthost, uint16_t handle, uint16_t cid,
 
 void bthost_send_cid(struct bthost *bthost, uint16_t handle, uint16_t cid,
 					const void *data, uint16_t len);
+void bthost_send_cid_v(struct bthost *bthost, uint16_t handle, uint16_t cid,
+					const struct iovec *iov, int iovcnt);
 
 typedef void (*bthost_l2cap_rsp_cb) (uint8_t code, const void *data,
 						uint16_t len, void *user_data);
@@ -91,8 +94,11 @@ void bthost_add_l2cap_server(struct bthost *bthost, uint16_t psm,
 void bthost_set_pin_code(struct bthost *bthost, const uint8_t *pin,
 							uint8_t pin_len);
 void bthost_set_io_capability(struct bthost *bthost, uint8_t io_capability);
+uint8_t bthost_get_io_capability(struct bthost *bthost);
 void bthost_set_auth_req(struct bthost *bthost, uint8_t auth_req);
+uint8_t bthost_get_auth_req(struct bthost *bthost);
 void bthost_set_reject_user_confirm(struct bthost *bthost, bool reject);
+bool bthost_get_reject_user_confirm(struct bthost *bthost);
 
 typedef void (*bthost_rfcomm_connect_cb) (uint16_t handle, uint16_t cid,
 						void *user_data, bool status);
@@ -126,6 +132,7 @@ void smp_stop(void *smp_data);
 void *smp_conn_add(void *smp_data, uint16_t handle, const uint8_t *ia,
 					const uint8_t *ra, bool conn_init);
 void smp_conn_del(void *conn_data);
+void smp_conn_encrypted(void *conn_data, uint8_t encrypt);
 void smp_data(void *conn_data, const void *data, uint16_t len);
 int smp_get_ltk(void *smp_data, uint64_t rand, uint16_t ediv, uint8_t *ltk);
-void smp_pair(void *conn_data);
+void smp_pair(void *conn_data, uint8_t io_cap, uint8_t auth_req);

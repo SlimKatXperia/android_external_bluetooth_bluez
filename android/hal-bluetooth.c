@@ -29,8 +29,6 @@
 #include "hal-ipc.h"
 #include "hal-utils.h"
 
-#define MODE_PROPERTY_NAME "persist.sys.bluetooth.mode"
-
 static const bt_callbacks_t *bt_hal_cbacks = NULL;
 
 #define enum_prop_to_hal(prop, hal_prop, type) do { \
@@ -394,15 +392,79 @@ static uint8_t get_mode(void)
 {
 	char value[PROPERTY_VALUE_MAX];
 
-	if (property_get(MODE_PROPERTY_NAME, value, "") > 0 &&
-					(!strcasecmp(value, "bredr")))
-		return HAL_MODE_BREDR;
+	if (get_config("mode", value, NULL) > 0) {
+		if (!strcasecmp(value, "bredr"))
+			return HAL_MODE_BREDR;
 
-	if (property_get(MODE_PROPERTY_NAME, value, "") > 0 &&
-					(!strcasecmp(value, "le")))
-		return HAL_MODE_LE;
+		if (!strcasecmp(value, "le"))
+			return HAL_MODE_LE;
+	}
 
 	return HAL_MODE_DEFAULT;
+}
+
+static uint16_t add_prop(const char *prop, uint8_t type, void *buf)
+{
+	struct hal_config_prop *hal_prop = buf;
+
+	hal_prop->type = type;
+	hal_prop->len = strlen(prop) + 1;
+	memcpy(hal_prop->val, prop, hal_prop->len);
+
+	return sizeof(*hal_prop) + hal_prop->len;
+}
+
+static int send_configuration(void)
+{
+	char buf[IPC_MTU];
+	struct hal_cmd_configuration *cmd = (void *) buf;
+	char prop[PROPERTY_VALUE_MAX];
+	uint16_t len = sizeof(*cmd);
+
+	cmd->num = 0;
+
+	if (get_config("vendor", prop, "ro.product.manufacturer") > 0) {
+		len += add_prop(prop, HAL_CONFIG_VENDOR, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("name", prop, "ro.product.name") > 0) {
+		len += add_prop(prop, HAL_CONFIG_NAME, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("model", prop, "ro.product.model") > 0) {
+		len += add_prop(prop, HAL_CONFIG_MODEL, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("serialno", prop, "ro.serialno") > 0) {
+		len += add_prop(prop, HAL_CONFIG_SERIAL_NUMBER, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("systemid", prop, NULL) > 0) {
+		len += add_prop(prop, HAL_CONFIG_SYSTEM_ID, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("pnpid", prop, NULL) > 0) {
+		len += add_prop(prop, HAL_CONFIG_PNP_ID, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("fwrev", prop, "ro.build.version.release") > 0) {
+		len += add_prop(prop, HAL_CONFIG_FW_REV, buf + len);
+		cmd->num++;
+	}
+
+	if (get_config("hwrev", prop, "ro.board.platform") > 0) {
+		len += add_prop(prop, HAL_CONFIG_HW_REV, buf + len);
+		cmd->num++;
+	}
+
+	return hal_ipc_cmd(HAL_SERVICE_ID_CORE, HAL_OP_CONFIGURATION, len, cmd,
+							NULL, NULL, NULL);
 }
 
 static int init(bt_callbacks_t *callbacks)
@@ -435,6 +497,12 @@ static int init(bt_callbacks_t *callbacks)
 		hal_ipc_cleanup();
 		bt_hal_cbacks = NULL;
 		return BT_STATUS_FAIL;
+	}
+
+	status = send_configuration();
+	if (status != BT_STATUS_SUCCESS) {
+		error("Failed to send configuration");
+		goto fail;
 	}
 
 	cmd.service_id = HAL_SERVICE_ID_BLUETOOTH;
@@ -782,6 +850,11 @@ static const void *get_profile_interface(const char *profile_id)
 
 	if (!strcmp(profile_id, BT_PROFILE_HEALTH_ID))
 		return bt_get_health_interface();
+
+#if BLUEZ_EXTENSIONS
+	if (!strcmp(profile_id, BT_PROFILE_HANDSFREE_CLIENT_ID))
+		return bt_get_hf_client_interface();
+#endif
 
 	return NULL;
 }

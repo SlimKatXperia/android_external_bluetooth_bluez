@@ -25,6 +25,8 @@
 #include <config.h>
 #endif
 
+#include <errno.h>
+
 #include <glib.h>
 
 #include "src/shared/io.h"
@@ -122,7 +124,7 @@ void io_destroy(struct io *io)
 int io_get_fd(struct io *io)
 {
 	if (!io)
-		return -1;
+		return -ENOTCONN;
 
 	return g_io_channel_unix_get_fd(io->channel);
 }
@@ -322,6 +324,26 @@ done:
 	io->disconnect_callback = callback;
 
 	return true;
+}
+
+ssize_t io_send(struct io *io, const struct iovec *iov, int iovcnt)
+{
+	int fd;
+	ssize_t ret;
+
+	if (!io || !io->channel)
+		return -ENOTCONN;
+
+	fd = io_get_fd(io);
+
+	do {
+		ret = writev(fd, iov, iovcnt);
+	} while (ret < 0 && errno == EINTR);
+
+	if (ret < 0)
+		return -errno;
+
+	return ret;
 }
 
 bool io_shutdown(struct io *io)

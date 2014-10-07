@@ -47,7 +47,7 @@
 #include "src/oui.h"
 
 /* Unofficial value, might still change */
-#define LE_LINK		0x03
+#define LE_LINK		0x80
 
 #define FLAGS_AD_TYPE 0x01
 #define FLAGS_LIMITED_MODE_BIT 0x01
@@ -2528,13 +2528,13 @@ static void cmd_lescan(int dev_id, int argc, char **argv)
 	}
 
 	err = hci_le_set_scan_parameters(dd, scan_type, interval, window,
-						own_type, filter_policy, 1000);
+						own_type, filter_policy, 10000);
 	if (err < 0) {
 		perror("Set scan parameters failed");
 		exit(1);
 	}
 
-	err = hci_le_set_scan_enable(dd, 0x01, filter_dup, 1000);
+	err = hci_le_set_scan_enable(dd, 0x01, filter_dup, 10000);
 	if (err < 0) {
 		perror("Enable scan failed");
 		exit(1);
@@ -2548,11 +2548,109 @@ static void cmd_lescan(int dev_id, int argc, char **argv)
 		exit(1);
 	}
 
-	err = hci_le_set_scan_enable(dd, 0x00, filter_dup, 1000);
+	err = hci_le_set_scan_enable(dd, 0x00, filter_dup, 10000);
 	if (err < 0) {
 		perror("Disable scan failed");
 		exit(1);
 	}
+
+	hci_close_dev(dd);
+}
+
+static struct option leinfo_options[] = {
+	{ "help",	0, 0, 'h' },
+	{ "random",	0, 0, 'r' },
+	{ 0, 0, 0, 0 }
+};
+
+static const char *leinfo_help =
+	"Usage:\n"
+	"\tleinfo [--random] <bdaddr>\n";
+
+static void cmd_leinfo(int dev_id, int argc, char **argv)
+{
+	bdaddr_t bdaddr;
+	uint8_t bdaddr_type;
+	uint16_t handle;
+	uint8_t features[8];
+	struct hci_version version;
+	uint16_t interval, latency, max_ce_length, max_interval, min_ce_length;
+	uint16_t min_interval, supervision_timeout, window;
+	uint8_t initiator_filter, own_type;
+	int opt, err, dd;
+
+	bdaddr_type = LE_PUBLIC_ADDRESS;
+
+	for_each_opt(opt, leinfo_options, NULL) {
+		switch (opt) {
+		case 'r':
+			bdaddr_type = LE_RANDOM_ADDRESS;
+			break;
+		default:
+			printf("%s", leinfo_help);
+			return;
+		}
+	}
+	helper_arg(1, 1, &argc, &argv, leinfo_help);
+
+	str2ba(argv[0], &bdaddr);
+
+	printf("Requesting information ...\n");
+
+	if (dev_id < 0)
+		dev_id = hci_get_route(NULL);
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0) {
+		perror("Could not open device");
+		exit(1);
+	}
+
+	interval = htobs(0x0004);
+	window = htobs(0x0004);
+	initiator_filter = 0;
+	own_type = LE_PUBLIC_ADDRESS;
+	min_interval = htobs(0x000F);
+	max_interval = htobs(0x000F);
+	latency = htobs(0x0000);
+	supervision_timeout = htobs(0x0C80);
+	min_ce_length = htobs(0x0000);
+	max_ce_length = htobs(0x0000);
+
+	err = hci_le_create_conn(dd, interval, window, initiator_filter,
+			bdaddr_type, bdaddr, own_type, min_interval,
+			max_interval, latency, supervision_timeout,
+			min_ce_length, max_ce_length, &handle, 25000);
+	if (err < 0) {
+		perror("Could not create connection");
+		exit(1);
+	}
+
+	printf("\tHandle: %d (0x%04x)\n", handle, handle);
+
+	if (hci_read_remote_version(dd, handle, &version, 20000) == 0) {
+		char *ver = lmp_vertostr(version.lmp_ver);
+		printf("\tLMP Version: %s (0x%x) LMP Subversion: 0x%x\n"
+			"\tManufacturer: %s (%d)\n",
+			ver ? ver : "n/a",
+			version.lmp_ver,
+			version.lmp_subver,
+			bt_compidtostr(version.manufacturer),
+			version.manufacturer);
+		if (ver)
+			bt_free(ver);
+	}
+
+	memset(features, 0, sizeof(features));
+	hci_le_read_remote_features(dd, handle, features, 20000);
+
+	printf("\tFeatures: 0x%2.2x 0x%2.2x 0x%2.2x 0x%2.2x "
+				"0x%2.2x 0x%2.2x 0x%2.2x 0x%2.2x\n",
+		features[0], features[1], features[2], features[3],
+		features[4], features[5], features[6], features[7]);
+
+	usleep(10000);
+	hci_disconnect(dd, handle, HCI_OE_USER_ENDED_CONNECTION, 10000);
 
 	hci_close_dev(dd);
 }
@@ -2979,6 +3077,7 @@ static struct {
 	{ "clkoff",   cmd_clkoff,  "Read clock offset"                    },
 	{ "clock",    cmd_clock,   "Read local or remote clock"           },
 	{ "lescan",   cmd_lescan,  "Start LE scan"                        },
+	{ "leinfo",   cmd_leinfo,  "Get LE remote information"            },
 	{ "lewladd",  cmd_lewladd, "Add device to LE White List"          },
 	{ "lewlrm",   cmd_lewlrm,  "Remove device from LE White List"     },
 	{ "lewlsz",   cmd_lewlsz,  "Read size of LE White List"           },

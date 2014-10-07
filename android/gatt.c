@@ -216,8 +216,6 @@ static const uint8_t TEST_UUID[] = {
 	0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04
 };
 
-static void bt_le_discovery_stop_cb(void);
-
 static bool is_bluetooth_uuid(const uint8_t *uuid)
 {
 	int i;
@@ -1269,6 +1267,7 @@ reply:
 	send_client_search_complete_notify(gatt_status, cb_data->conn->id);
 	free(cb_data);
 }
+
 static gboolean connection_timeout(void *user_data)
 {
 	struct app_connection *conn = user_data;
@@ -1585,6 +1584,15 @@ static int connect_next_dev(void)
 	return connect_le(dev);
 }
 
+static void bt_le_discovery_stop_cb(void)
+{
+	DBG("");
+
+	/* Check now if there is any device ready to connect */
+	if (connect_next_dev() < 0)
+		bt_le_discovery_start();
+}
+
 static void le_device_found_handler(const bdaddr_t *addr, uint8_t addr_type,
 						int rssi, uint16_t eir_len,
 						const void *eir,
@@ -1760,15 +1768,6 @@ reply:
 									status);
 }
 
-static void bt_le_discovery_stop_cb(void)
-{
-	DBG("");
-
-	/* Check now if there is any device ready to connect */
-	if (connect_next_dev() < 0)
-		bt_le_discovery_start();
-}
-
 static void trigger_disconnection(struct app_connection *connection)
 {
 	/* Notify client */
@@ -1888,8 +1887,6 @@ static void clear_autoconnect_devices(void *data, void *user_data)
 	if (queue_remove(dev->autoconnect_apps, user_data))
 		if (queue_isempty(dev->autoconnect_apps))
 			remove_autoconnect_device(dev);
-
-
 }
 
 static uint8_t unregister_app(int client_if)
@@ -2517,26 +2514,47 @@ reply:
 			HAL_OP_GATT_CLIENT_GET_INCLUDED_SERVICE, status);
 }
 
-static void send_client_char_notify(const struct characteristic *ch,
-					int32_t conn_id,
-					const struct service *service)
+static void send_client_char_notify(const struct hal_gatt_srvc_id *service,
+					const struct hal_gatt_gatt_id *charac,
+					int32_t char_prop, int32_t conn_id)
 {
 	struct hal_ev_gatt_client_get_characteristic ev;
 
-	memset(&ev, 0, sizeof(ev));
-	ev.status = ch ? GATT_SUCCESS : GATT_FAILURE;
+	ev.conn_id = conn_id;
 
-	if (ch) {
-		ev.char_prop = ch->ch.properties;
-		element_id_to_hal_gatt_id(&ch->id, &ev.char_id);
+	if (charac) {
+		memcpy(&ev.char_id, charac, sizeof(struct hal_gatt_gatt_id));
+		ev.char_prop = char_prop;
+		ev.status = GATT_SUCCESS;
+	} else {
+		memset(&ev.char_id, 0, sizeof(struct hal_gatt_gatt_id));
+		ev.char_prop = 0;
+		ev.status = GATT_FAILURE;
 	}
 
-	ev.conn_id = conn_id;
-	element_id_to_hal_srvc_id(&service->id, service->primary, &ev.srvc_id);
+	memcpy(&ev.srvc_id, service, sizeof(struct hal_gatt_srvc_id));
 
 	ipc_send_notif(hal_ipc, HAL_SERVICE_ID_GATT,
 					HAL_EV_GATT_CLIENT_GET_CHARACTERISTIC,
 					sizeof(ev), &ev);
+}
+
+static void convert_send_client_char_notify(const struct characteristic *ch,
+					int32_t conn_id,
+					const struct service *service)
+{
+	struct hal_gatt_srvc_id srvc;
+	struct hal_gatt_gatt_id charac;
+
+	element_id_to_hal_srvc_id(&service->id, service->primary, &srvc);
+
+	if (ch) {
+		element_id_to_hal_gatt_id(&ch->id, &charac);
+		send_client_char_notify(&srvc, &charac, ch->ch.properties,
+								conn_id);
+	} else {
+		send_client_char_notify(&srvc, NULL, 0, conn_id);
+	}
 }
 
 static void cache_all_srvc_chars(struct service *srvc, GSList *characteristics)
@@ -2604,8 +2622,8 @@ static void discover_char_cb(uint8_t status, GSList *characteristics,
 	if (queue_isempty(srvc->chars))
 		cache_all_srvc_chars(srvc, characteristics);
 
-	send_client_char_notify(queue_peek_head(srvc->chars), data->conn_id,
-									srvc);
+	convert_send_client_char_notify(queue_peek_head(srvc->chars),
+							data->conn_id, srvc);
 
 	free(data);
 }
@@ -2636,11 +2654,10 @@ static void handle_client_get_characteristic(const void *buf, uint16_t len)
 
 	/* Discover all characteristics for services if not cached yet */
 	if (queue_isempty(srvc->chars)) {
+		struct discover_char_data *cb_data;
 		struct att_range range;
 
-		struct discover_char_data *cb_data =
-					new0(struct discover_char_data, 1);
-
+		cb_data = new0(struct discover_char_data, 1);
 		if (!cb_data) {
 			error("gatt: Cannot allocate cb data");
 			status = HAL_STATUS_FAILED;
@@ -2671,11 +2688,14 @@ static void handle_client_get_characteristic(const void *buf, uint16_t len)
 	else
 		ch = queue_peek_head(srvc->chars);
 
-	send_client_char_notify(ch, conn->id, srvc);
+	convert_send_client_char_notify(ch, conn->id, srvc);
 
 	status = HAL_STATUS_SUCCESS;
 
 done:
+	if (status != HAL_STATUS_SUCCESS)
+		send_client_char_notify(&cmd->srvc_id, NULL, 0, cmd->conn_id);
+
 	ipc_send_rsp(hal_ipc, HAL_SERVICE_ID_GATT,
 				HAL_OP_GATT_CLIENT_GET_CHARACTERISTIC, status);
 }
@@ -2736,7 +2756,7 @@ static void gatt_discover_desc_cb(guint8 status, GSList *descs,
 		bt_string_to_uuid(&uuid, desc->uuid);
 		bt_uuid_to_uuid128(&uuid, &descr->id.uuid);
 
-		descr->id.instance = i++;
+		descr->id.instance = ++i;
 		descr->handle = desc->handle;
 
 		DBG("attr handle = 0x%04x, uuid: %s", desc->handle, desc->uuid);
@@ -2748,9 +2768,9 @@ static void gatt_discover_desc_cb(guint8 status, GSList *descs,
 reply:
 	descr = queue_peek_head(ch->descriptors);
 
-	send_client_descr_notify(status, conn->id, srvc->primary, &srvc->id,
-						&ch->id,
-						descr ? &descr->id : NULL);
+	send_client_descr_notify(status ? GATT_FAILURE : GATT_SUCCESS, conn->id,
+					srvc->primary, &srvc->id, &ch->id,
+					descr ? &descr->id : NULL);
 
 	free(data);
 }
@@ -3107,6 +3127,7 @@ static void send_client_write_char_notify(int32_t status, int32_t conn_id,
 
 	ev.conn_id = conn_id;
 	ev.status = status;
+	ev.data.status = status;
 
 	element_id_to_hal_srvc_id(srvc_id, primary, &ev.data.srvc_id);
 	element_id_to_hal_gatt_id(char_id, &ev.data.char_id);
@@ -3148,7 +3169,7 @@ static guint signed_write_cmd(struct gatt_device *dev, uint16_t handle,
 		return 0;
 	}
 
-	bt_update_sign_counter(&dev->bdaddr, LOCAL_CSRK);
+	bt_update_sign_counter(&dev->bdaddr, LOCAL_CSRK, sign_cnt++);
 
 	return res;
 }
@@ -5332,7 +5353,6 @@ static bool match_trans_id(const void *data, const void *user_data)
 	return transaction->id == PTR_TO_UINT(user_data);
 }
 
-
 static bool find_conn_waiting_exec_write(const void *data,
 							const void *user_data)
 {
@@ -5758,7 +5778,6 @@ static uint8_t find_info_handle(const uint8_t *cmd, uint16_t cmd_len,
 
 		put_le16(handle, value);
 		memcpy(&value[2], &type->value.u16, bt_uuid_len(type));
-
 	}
 
 	len = enc_find_info_resp(ATT_FIND_INFO_RESP_FMT_16BIT, adl, rsp,
@@ -5903,16 +5922,16 @@ static void write_signed_cmd_request(const uint8_t *cmd, uint16_t cmd_len,
 		uint8_t t[ATT_SIGNATURE_LEN];
 		uint32_t r_sign_cnt = get_le32(s);
 
-		if (r_sign_cnt != sign_cnt) {
-			error("gatt: sign_cnt does not match (%d!=%d)",
-							sign_cnt, r_sign_cnt);
+		if (r_sign_cnt <= sign_cnt) {
+			error("gatt: Invalid sign counter (%d<=%d)",
+							r_sign_cnt, sign_cnt);
 			return;
 		}
 
 		/* Generate signature and verify it */
 		if (!bt_crypto_sign_att(crypto, csrk, cmd,
 						cmd_len - ATT_SIGNATURE_LEN,
-						sign_cnt, t)) {
+						r_sign_cnt, t)) {
 			error("gatt: Error when generating att signature");
 			return;
 		}
@@ -5922,7 +5941,7 @@ static void write_signed_cmd_request(const uint8_t *cmd, uint16_t cmd_len,
 			return;
 		}
 		/* Signature OK, proceed with write */
-		bt_update_sign_counter(&dev->bdaddr, REMOTE_CSRK);
+		bt_update_sign_counter(&dev->bdaddr, REMOTE_CSRK, r_sign_cnt);
 		gatt_db_write(gatt_db, handle, 0, value, vlen, cmd[0],
 								&dev->bdaddr);
 	}
@@ -6174,17 +6193,6 @@ done:
 									NULL);
 }
 
-static void create_listen_connections(void *data, void *user_data)
-{
-	struct gatt_device *dev = user_data;
-	int32_t id = PTR_TO_INT(data);
-	struct gatt_app *app;
-
-	app = find_app_by_id(id);
-	if (app)
-		create_connection(dev, app);
-}
-
 static void connect_confirm(GIOChannel *io, void *user_data)
 {
 	struct gatt_device *dev;
@@ -6233,7 +6241,7 @@ static void connect_confirm(GIOChannel *io, void *user_data)
 		goto drop;
 	}
 
-	queue_foreach(listen_apps, create_listen_connections, dev);
+	queue_foreach(listen_apps, create_app_connection, dev);
 	device_set_state(dev, DEVICE_CONNECT_READY);
 
 	return;
@@ -6362,23 +6370,6 @@ static void register_gap_service(void)
 		error("gatt: Failed to register GAP SDP record");
 }
 
-/* TODO: Get those data from device possible via androig/bluetooth.c */
-static struct device_info {
-	const char *manufacturer_name;
-	const char *model_number;
-	const char *serial_number;
-	const char *firmware_rev;
-	const char *hardware_rev;
-	const char *software_rev;
-} device_info = {
-	.manufacturer_name =	"BlueZ for Android",
-	.model_number =		"model no",
-	.serial_number =	"serial no",
-	.firmware_rev =		"firmware rev",
-	.hardware_rev =		"hardware rev",
-	.software_rev =		"software rev",
-};
-
 static void device_info_read_cb(uint16_t handle, uint16_t offset,
 					uint8_t att_opcode, bdaddr_t *bdaddr,
 					void *user_data)
@@ -6412,10 +6403,81 @@ done:
 	entry->state = REQUEST_DONE;
 }
 
+static void device_info_read_system_id_cb(uint16_t handle, uint16_t offset,
+					uint8_t att_opcode, bdaddr_t *bdaddr,
+					void *user_data)
+{
+	struct pending_request *entry;
+	struct gatt_device *dev;
+
+	dev = find_device_by_addr(bdaddr);
+	if (!dev) {
+		error("gatt: Could not find device ?!");
+		return;
+	}
+
+	entry = queue_find(dev->pending_requests, match_dev_request_by_handle,
+							UINT_TO_PTR(handle));
+	if (!entry)
+		return;
+
+	entry->value = malloc0(sizeof(uint64_t));
+	if (!entry->value) {
+		entry->error = ATT_ECODE_UNLIKELY;
+		goto done;
+	}
+
+	entry->length = sizeof(uint64_t);
+	put_le64(bt_config_get_system_id(), entry->value);
+	entry->offset = offset;
+
+done:
+	entry->state = REQUEST_DONE;
+}
+
+static void device_info_read_pnp_id_cb(uint16_t handle, uint16_t offset,
+					uint8_t att_opcode, bdaddr_t *bdaddr,
+					void *user_data)
+{
+	struct pending_request *entry;
+	struct gatt_device *dev;
+
+	dev = find_device_by_addr(bdaddr);
+	if (!dev) {
+		error("gatt: Could not find device ?!");
+		return;
+	}
+
+	entry = queue_find(dev->pending_requests, match_dev_request_by_handle,
+							UINT_TO_PTR(handle));
+	if (!entry)
+		return;
+
+	entry->value = malloc0(sizeof(uint8_t) + 3 * sizeof(uint16_t));
+	if (!entry->value) {
+		entry->error = ATT_ECODE_UNLIKELY;
+		goto done;
+	}
+
+	entry->length = sizeof(uint8_t) + 3 * sizeof(uint16_t);
+
+	entry->value[0] = bt_config_get_pnp_source();
+	put_le16(bt_config_get_pnp_vendor(), entry->value + 1);
+	put_le16(bt_config_get_pnp_product(), entry->value + 3);
+	put_le16(bt_config_get_pnp_version(), entry->value + 5);
+
+	entry->offset = offset;
+
+done:
+	entry->state = REQUEST_DONE;
+}
+
 static void register_device_info_service(void)
 {
 	bt_uuid_t uuid;
 	uint16_t srvc_handle, end_handle;
+	const char *data;
+	uint32_t enc_perm = GATT_PERM_READ | GATT_PERM_READ_ENCRYPTED;
 
 	DBG("");
 
@@ -6424,41 +6486,76 @@ static void register_device_info_service(void)
 	srvc_handle = gatt_db_add_service(gatt_db, &uuid, true, 15);
 
 	/* User data are not const hence (void *) cast is used */
-	bt_uuid16_create(&uuid, GATT_CHARAC_MODEL_NUMBER_STRING);
-	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.model_number);
+	data = bt_config_get_name();
+	if (data) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_MODEL_NUMBER_STRING);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						GATT_PERM_READ,
+						GATT_CHR_PROP_READ,
+						device_info_read_cb, NULL,
+						(void *) data);
+	}
 
-	bt_uuid16_create(&uuid, GATT_CHARAC_SERIAL_NUMBER_STRING);
-	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.serial_number);
+	data = bt_config_get_serial();
+	if (data) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_SERIAL_NUMBER_STRING);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						enc_perm, GATT_CHR_PROP_READ,
+						device_info_read_cb, NULL,
+						(void *) data);
+	}
 
-	bt_uuid16_create(&uuid, GATT_CHARAC_FIRMWARE_REVISION_STRING);
-	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.firmware_rev);
+	if (bt_config_get_system_id()) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_SYSTEM_ID);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						enc_perm, GATT_CHR_PROP_READ,
+						device_info_read_system_id_cb,
+						NULL, NULL);
+	}
 
-	bt_uuid16_create(&uuid, GATT_CHARAC_HARDWARE_REVISION_STRING);
-	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.hardware_rev);
+	data = bt_config_get_fw_rev();
+	if (data) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_FIRMWARE_REVISION_STRING);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						GATT_PERM_READ,
+						GATT_CHR_PROP_READ,
+						device_info_read_cb, NULL,
+						(void *) data);
+	}
+
+	data = bt_config_get_hw_rev();
+	if (data) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_HARDWARE_REVISION_STRING);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						GATT_PERM_READ,
+						GATT_CHR_PROP_READ,
+						device_info_read_cb, NULL,
+						(void *) data);
+	}
 
 	bt_uuid16_create(&uuid, GATT_CHARAC_SOFTWARE_REVISION_STRING);
 	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.software_rev);
+					GATT_CHR_PROP_READ, device_info_read_cb,
+					NULL, VERSION);
 
-	bt_uuid16_create(&uuid, GATT_CHARAC_MANUFACTURER_NAME_STRING);
-	gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid, GATT_PERM_READ,
-					GATT_CHR_PROP_READ,
-					device_info_read_cb, NULL,
-					(void *) device_info.manufacturer_name);
+	data = bt_config_get_vendor();
+	if (data) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_MANUFACTURER_NAME_STRING);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						GATT_PERM_READ,
+						GATT_CHR_PROP_READ,
+						device_info_read_cb, NULL,
+						(void *) data);
+	}
+
+	if (bt_config_get_pnp_source()) {
+		bt_uuid16_create(&uuid, GATT_CHARAC_PNP_ID);
+		gatt_db_add_characteristic(gatt_db, srvc_handle, &uuid,
+						GATT_PERM_READ,
+						GATT_CHR_PROP_READ,
+						device_info_read_pnp_id_cb,
+						NULL, NULL);
+	}
 
 	gatt_db_service_set_active(gatt_db, srvc_handle, true);
 
@@ -6860,6 +6957,4 @@ void bt_gatt_remove_autoconnect(unsigned int id, const bdaddr_t *addr)
 
 	if (queue_isempty(dev->autoconnect_apps))
 		remove_autoconnect_device(dev);
-
-		device_unref(dev);
 }

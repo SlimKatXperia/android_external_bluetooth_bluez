@@ -44,6 +44,12 @@
 
 #define SMP_CID 0x0006
 
+#define DIST_ENC_KEY	0x01
+#define DIST_ID_KEY	0x02
+#define DIST_SIGN	0x04
+
+#define KEY_DIST (DIST_ENC_KEY | DIST_ID_KEY | DIST_SIGN)
+
 struct smp {
 	struct bthost *bthost;
 	struct smp_conn *conn;
@@ -54,6 +60,8 @@ struct smp_conn {
 	struct smp *smp;
 	uint16_t handle;
 	bool out;
+	uint8_t local_key_dist;
+	uint8_t remote_key_dist;
 	uint8_t ia[6];
 	uint8_t ia_type;
 	uint8_t ra[6];
@@ -66,6 +74,20 @@ struct smp_conn {
 	uint8_t prsp[7];
 	uint8_t ltk[16];
 };
+
+static void smp_send(struct smp_conn *conn, uint8_t smp_cmd, const void *data,
+								uint8_t len)
+{
+	struct iovec iov[2];
+
+	iov[0].iov_base = &smp_cmd;
+	iov[0].iov_len = 1;
+
+	iov[1].iov_base = (void *) data;
+	iov[1].iov_len = len;
+
+	bthost_send_cid_v(conn->smp->bthost, conn->handle, SMP_CID, iov, 2);
+}
 
 static bool verify_random(struct smp_conn *conn, const uint8_t rnd[16])
 {
@@ -97,78 +119,157 @@ static bool verify_random(struct smp_conn *conn, const uint8_t rnd[16])
 static void pairing_req(struct smp_conn *conn, const void *data, uint16_t len)
 {
 	struct bthost *bthost = conn->smp->bthost;
-	static const uint8_t rsp[] = {	0x02,	/* Pairing Response */
-					0x03,	/* NoInputNoOutput */
-					0x00,	/* OOB Flag */
-					0x01,	/* Bonding - no MITM */
-					0x10,	/* Max key size */
-					0x00,	/* Init. key dist. */
-					0x01,	/* Rsp. key dist. */
-				};
+	struct bt_l2cap_smp_pairing_response rsp;
 
 	memcpy(conn->preq, data, sizeof(conn->preq));
-	memcpy(conn->prsp, rsp, sizeof(rsp));
 
-	bthost_send_cid(bthost, conn->handle, SMP_CID, rsp, sizeof(rsp));
+	rsp.io_capa		= bthost_get_io_capability(bthost);
+	rsp.oob_data		= 0x00;
+	rsp.auth_req		= bthost_get_auth_req(bthost);
+	rsp.max_key_size	= 0x10;
+	rsp.init_key_dist	= conn->preq[5] & KEY_DIST;
+	rsp.resp_key_dist	= conn->preq[6] & KEY_DIST;
+
+	conn->prsp[0] = BT_L2CAP_SMP_PAIRING_RESPONSE;
+	memcpy(&conn->prsp[1], &rsp, sizeof(rsp));
+
+	conn->local_key_dist	= rsp.resp_key_dist;
+	conn->remote_key_dist	= rsp.init_key_dist;
+
+	smp_send(conn, BT_L2CAP_SMP_PAIRING_RESPONSE, &rsp, sizeof(rsp));
 }
 
 static void pairing_rsp(struct smp_conn *conn, const void *data, uint16_t len)
 {
+	struct smp *smp = conn->smp;
+	uint8_t cfm[16];
+
 	memcpy(conn->prsp, data, sizeof(conn->prsp));
 
-	/*bthost_send_cid(bthost, handle, SMP_CID, pdu, req->send_len);*/
+	conn->local_key_dist = conn->prsp[5];
+	conn->remote_key_dist = conn->prsp[6];
+
+	bt_crypto_c1(smp->crypto, conn->tk, conn->prnd, conn->prsp,
+			conn->preq, conn->ia_type, conn->ia,
+			conn->ra_type, conn->ra, cfm);
+
+	smp_send(conn, BT_L2CAP_SMP_PAIRING_CONFIRM, cfm, sizeof(cfm));
 }
 
 static void pairing_cfm(struct smp_conn *conn, const void *data, uint16_t len)
 {
-	struct bthost *bthost = conn->smp->bthost;
-	const uint8_t *cfm = data;
-	uint8_t rsp[17];
+	uint8_t rsp[16];
 
 	memcpy(conn->pcnf, data + 1, 16);
 
-	rsp[0] = cfm[0];
-	bt_crypto_c1(conn->smp->crypto, conn->tk, conn->prnd, conn->prsp,
-				conn->preq, conn->ia_type, conn->ia,
-				conn->ra_type, conn->ra, &rsp[1]);
-
-	bthost_send_cid(bthost, conn->handle, SMP_CID, rsp, sizeof(rsp));
+	if (conn->out) {
+		memset(rsp, 0, sizeof(rsp));
+		smp_send(conn, BT_L2CAP_SMP_PAIRING_RANDOM, rsp, sizeof(rsp));
+	} else {
+		bt_crypto_c1(conn->smp->crypto, conn->tk, conn->prnd,
+				conn->prsp, conn->preq, conn->ia_type,
+				conn->ia, conn->ra_type, conn->ra, rsp);
+		smp_send(conn, BT_L2CAP_SMP_PAIRING_CONFIRM, rsp, sizeof(rsp));
+	}
 }
 
 static void pairing_rnd(struct smp_conn *conn, const void *data, uint16_t len)
 {
-	struct bthost *bthost = conn->smp->bthost;
-	const uint8_t *rnd = data;
-	uint8_t rsp[17];
+	uint8_t rsp[16];
 
 	memcpy(conn->rrnd, data + 1, 16);
 
 	if (!verify_random(conn, data + 1))
 		return;
 
-	rsp[0] = rnd[0];
-	memcpy(&rsp[1], conn->prnd, 16);
+	if (conn->out)
+		return;
 
-	bthost_send_cid(bthost, conn->handle, SMP_CID, rsp, sizeof(rsp));
+	memset(rsp, 0, sizeof(rsp));
+	smp_send(conn, BT_L2CAP_SMP_PAIRING_RANDOM, rsp, sizeof(rsp));
 }
 
-void smp_pair(void *conn_data)
+static void distribute_keys(struct smp_conn *conn)
+{
+	uint8_t buf[16];
+
+	if (conn->local_key_dist & DIST_ENC_KEY) {
+		memset(buf, 0, sizeof(buf));
+		smp_send(conn, BT_L2CAP_SMP_ENCRYPT_INFO, buf, sizeof(buf));
+		smp_send(conn, BT_L2CAP_SMP_MASTER_IDENT, buf, 10);
+	}
+
+	if (conn->local_key_dist & DIST_ID_KEY) {
+		memset(buf, 0, sizeof(buf));
+
+		if (conn->out) {
+			buf[0] = conn->ia_type;
+			memcpy(&buf[1], conn->ia, 6);
+		} else {
+			buf[0] = conn->ra_type;
+			memcpy(&buf[1], conn->ra, 6);
+		}
+		smp_send(conn, BT_L2CAP_SMP_IDENT_ADDR_INFO, buf, 7);
+
+		memset(buf, 0, sizeof(buf));
+		smp_send(conn, BT_L2CAP_SMP_IDENT_INFO, buf, sizeof(buf));
+	}
+
+	if (conn->local_key_dist & DIST_SIGN) {
+		memset(buf, 0, sizeof(buf));
+		smp_send(conn, BT_L2CAP_SMP_SIGNING_INFO, buf, sizeof(buf));
+	}
+}
+
+static void encrypt_info(struct smp_conn *conn, const void *data, uint16_t len)
+{
+}
+
+static void master_ident(struct smp_conn *conn, const void *data, uint16_t len)
+{
+	conn->remote_key_dist &= ~DIST_ENC_KEY;
+
+	if (conn->out && !conn->remote_key_dist)
+		distribute_keys(conn);
+}
+
+static void ident_addr_info(struct smp_conn *conn, const void *data,
+								uint16_t len)
+{
+}
+
+static void ident_info(struct smp_conn *conn, const void *data, uint16_t len)
+{
+	conn->remote_key_dist &= ~DIST_ID_KEY;
+
+	if (conn->out && !conn->remote_key_dist)
+		distribute_keys(conn);
+}
+
+static void signing_info(struct smp_conn *conn, const void *data, uint16_t len)
+{
+	conn->remote_key_dist &= ~DIST_SIGN;
+
+	if (conn->out && !conn->remote_key_dist)
+		distribute_keys(conn);
+}
+
+void smp_pair(void *conn_data, uint8_t io_cap, uint8_t auth_req)
 {
 	struct smp_conn *conn = conn_data;
-	struct bthost *bthost = conn->smp->bthost;
-	const uint8_t smp_pair_req[] = {	0x01,	/* Pairing Request */
-						0x03,	/* NoInputNoOutput */
-						0x00,	/* OOB Flag */
-						0x01,	/* Bonding - no MITM */
-						0x10,	/* Max key size */
-						0x00,	/* Init. key dist. */
-						0x01,	/* Rsp. key dist. */
-					};
+	struct bt_l2cap_smp_pairing_request req;
 
-	memcpy(conn->preq, smp_pair_req, sizeof(smp_pair_req));
+	req.io_capa		= io_cap;
+	req.oob_data		= 0x00;
+	req.auth_req		= auth_req;
+	req.max_key_size	= 0x10;
+	req.init_key_dist	= KEY_DIST;
+	req.resp_key_dist	= KEY_DIST;
 
-	bthost_send_cid(bthost, conn->handle, SMP_CID, smp_pair_req,
-							sizeof(smp_pair_req));
+	conn->preq[0] = BT_L2CAP_SMP_PAIRING_REQUEST;
+	memcpy(&conn->preq[1], &req, sizeof(req));
+
+	smp_send(conn, BT_L2CAP_SMP_PAIRING_REQUEST, &req, sizeof(req));
 }
 
 void smp_data(void *conn_data, const void *data, uint16_t len)
@@ -184,17 +285,32 @@ void smp_data(void *conn_data, const void *data, uint16_t len)
 	opcode = *((const uint8_t *) data);
 
 	switch (opcode) {
-	case 0x01: /* Pairing Request */
+	case BT_L2CAP_SMP_PAIRING_REQUEST:
 		pairing_req(conn, data, len);
 		break;
-	case 0x02: /* Pairing Response */
+	case BT_L2CAP_SMP_PAIRING_RESPONSE:
 		pairing_rsp(conn, data, len);
 		break;
-	case 0x03: /* Pairing Confirm */
+	case BT_L2CAP_SMP_PAIRING_CONFIRM:
 		pairing_cfm(conn, data, len);
 		break;
-	case 0x04: /* Pairing Random */
+	case BT_L2CAP_SMP_PAIRING_RANDOM:
 		pairing_rnd(conn, data, len);
+		break;
+	case BT_L2CAP_SMP_ENCRYPT_INFO:
+		encrypt_info(conn, data, len);
+		break;
+	case BT_L2CAP_SMP_MASTER_IDENT:
+		master_ident(conn, data, len);
+		break;
+	case BT_L2CAP_SMP_IDENT_ADDR_INFO:
+		ident_addr_info(conn, data, len);
+		break;
+	case BT_L2CAP_SMP_IDENT_INFO:
+		ident_info(conn, data, len);
+		break;
+	case BT_L2CAP_SMP_SIGNING_INFO:
+		signing_info(conn, data, len);
 		break;
 	default:
 		break;
@@ -212,6 +328,19 @@ int smp_get_ltk(void *smp_data, uint64_t rand, uint16_t ediv, uint8_t *ltk)
 	memcpy(ltk, conn->ltk, 16);
 
 	return 0;
+}
+
+void smp_conn_encrypted(void *conn_data, uint8_t encrypt)
+{
+	struct smp_conn *conn = conn_data;
+
+	if (!encrypt)
+		return;
+
+	if (conn->out && conn->remote_key_dist)
+		return;
+
+	distribute_keys(conn);
 }
 
 void *smp_conn_add(void *smp_data, uint16_t handle, const uint8_t *ia,

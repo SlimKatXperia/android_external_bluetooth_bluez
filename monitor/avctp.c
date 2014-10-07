@@ -158,6 +158,42 @@
 #define AVRCP_ATTRIBUTE_SHUFFLE		0x03
 #define AVRCP_ATTRIBUTE_SCAN		0x04
 
+/* media attributes */
+#define AVRCP_MEDIA_ATTRIBUTE_ILLEGAL	0x00
+#define AVRCP_MEDIA_ATTRIBUTE_TITLE	0x01
+#define AVRCP_MEDIA_ATTRIBUTE_ARTIST	0x02
+#define AVRCP_MEDIA_ATTRIBUTE_ALBUM	0x03
+#define AVRCP_MEDIA_ATTRIBUTE_TRACK	0x04
+#define AVRCP_MEDIA_ATTRIBUTE_TOTAL	0x05
+#define AVRCP_MEDIA_ATTRIBUTE_GENRE	0x06
+#define AVRCP_MEDIA_ATTRIBUTE_DURATION	0x07
+
+/* play status */
+#define AVRCP_PLAY_STATUS_STOPPED	0x00
+#define AVRCP_PLAY_STATUS_PLAYING	0x01
+#define AVRCP_PLAY_STATUS_PAUSED	0x02
+#define AVRCP_PLAY_STATUS_FWD_SEEK	0x03
+#define AVRCP_PLAY_STATUS_REV_SEEK	0x04
+#define AVRCP_PLAY_STATUS_ERROR		0xFF
+
+/* media scope */
+#define AVRCP_MEDIA_PLAYER_LIST		0x00
+#define AVRCP_MEDIA_PLAYER_VFS		0x01
+#define AVRCP_MEDIA_SEARCH		0x02
+#define AVRCP_MEDIA_NOW_PLAYING		0x03
+
+struct avctp_frame {
+	uint8_t hdr;
+	uint8_t pt;
+	uint16_t pid;
+	struct l2cap_frame l2cap_frame;
+};
+
+static struct avrcp_continuing {
+	uint16_t num;
+	uint16_t size;
+} avrcp_continuing;
+
 static const char *ctype2str(uint8_t ctype)
 {
 	switch (ctype & 0x0f) {
@@ -517,15 +553,97 @@ static const char *charset2str(uint16_t charset)
 	}
 }
 
-static bool avrcp_passthrough_packet(struct l2cap_frame *frame)
+static const char *mediattr2str(uint32_t attr)
 {
+	switch (attr) {
+	case AVRCP_MEDIA_ATTRIBUTE_ILLEGAL:
+		return "Illegal";
+	case AVRCP_MEDIA_ATTRIBUTE_TITLE:
+		return "Title";
+	case AVRCP_MEDIA_ATTRIBUTE_ARTIST:
+		return "Artist";
+	case AVRCP_MEDIA_ATTRIBUTE_ALBUM:
+		return "Album";
+	case AVRCP_MEDIA_ATTRIBUTE_TRACK:
+		return "Track";
+	case AVRCP_MEDIA_ATTRIBUTE_TOTAL:
+		return "Track Total";
+	case AVRCP_MEDIA_ATTRIBUTE_GENRE:
+		return "Genre";
+	case AVRCP_MEDIA_ATTRIBUTE_DURATION:
+		return "Track duration";
+	default:
+		return "Reserved";
+	}
+}
+
+static const char *playstatus2str(uint8_t status)
+{
+	switch (status) {
+	case AVRCP_PLAY_STATUS_STOPPED:
+		return "STOPPED";
+	case AVRCP_PLAY_STATUS_PLAYING:
+		return "PLAYING";
+	case AVRCP_PLAY_STATUS_PAUSED:
+		return "PAUSED";
+	case AVRCP_PLAY_STATUS_FWD_SEEK:
+		return "FWD_SEEK";
+	case AVRCP_PLAY_STATUS_REV_SEEK:
+		return "REV_SEEK";
+	case AVRCP_PLAY_STATUS_ERROR:
+		return "ERROR";
+	default:
+		return "Unknown";
+	}
+}
+
+static const char *status2str(uint8_t status)
+{
+	switch (status) {
+	case 0x0:
+		return "NORMAL";
+	case 0x1:
+		return "WARNING";
+	case 0x2:
+		return "CRITICAL";
+	case 0x3:
+		return "EXTERNAL";
+	case 0x4:
+		return "FULL_CHARGE";
+	default:
+		return "Reserved";
+	}
+}
+
+static const char *scope2str(uint8_t scope)
+{
+	switch (scope) {
+	case AVRCP_MEDIA_PLAYER_LIST:
+		return "Media Player List";
+	case AVRCP_MEDIA_PLAYER_VFS:
+		return "Media Player Virtual Filesystem";
+	case AVRCP_MEDIA_SEARCH:
+		return "Search";
+	case AVRCP_MEDIA_NOW_PLAYING:
+		return "Now Playing";
+	default:
+		return "Unknown";
+	}
+}
+
+static bool avrcp_passthrough_packet(struct avctp_frame *avctp_frame)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+
 	packet_hexdump(frame->data, frame->size);
 	return true;
 }
 
-static bool avrcp_get_capabilities(struct l2cap_frame *frame, uint8_t ctype,
-						uint8_t len, uint8_t indent)
+static bool avrcp_get_capabilities(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t cap, count;
 	int i;
 
@@ -576,10 +694,11 @@ static bool avrcp_get_capabilities(struct l2cap_frame *frame, uint8_t ctype,
 	return true;
 }
 
-static bool avrcp_list_player_attributes(struct l2cap_frame *frame,
+static bool avrcp_list_player_attributes(struct avctp_frame *avctp_frame,
 						uint8_t ctype, uint8_t len,
 						uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t num;
 	int i;
 
@@ -604,9 +723,11 @@ static bool avrcp_list_player_attributes(struct l2cap_frame *frame,
 	return true;
 }
 
-static bool avrcp_list_player_values(struct l2cap_frame *frame, uint8_t ctype,
-						uint8_t len, uint8_t indent)
+static bool avrcp_list_player_values(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	static uint8_t attr = 0;
 	uint8_t num;
 
@@ -640,10 +761,11 @@ response:
 	return true;
 }
 
-static bool avrcp_get_current_player_value(struct l2cap_frame *frame,
+static bool avrcp_get_current_player_value(struct avctp_frame *avctp_frame,
 						uint8_t ctype, uint8_t len,
 						uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t num;
 
 	if (!l2cap_frame_get_u8(frame, &num))
@@ -688,9 +810,11 @@ response:
 	return true;
 }
 
-static bool avrcp_set_player_value(struct l2cap_frame *frame, uint8_t ctype,
-					uint8_t len, uint8_t indent)
+static bool avrcp_set_player_value(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t num;
 
 	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
@@ -720,10 +844,11 @@ static bool avrcp_set_player_value(struct l2cap_frame *frame, uint8_t ctype,
 	return true;
 }
 
-static bool avrcp_get_player_attribute_text(struct l2cap_frame *frame,
+static bool avrcp_get_player_attribute_text(struct avctp_frame *avctp_frame,
 						uint8_t ctype, uint8_t len,
 						uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t num;
 
 	if (!l2cap_frame_get_u8(frame, &num))
@@ -783,10 +908,11 @@ response:
 	return true;
 }
 
-static bool avrcp_get_player_value_text(struct l2cap_frame *frame,
+static bool avrcp_get_player_value_text(struct avctp_frame *avctp_frame,
 					uint8_t ctype, uint8_t len,
 					uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	static uint8_t attr = 0;
 	uint8_t num;
 
@@ -858,9 +984,11 @@ response:
 	return true;
 }
 
-static bool avrcp_displayable_charset(struct l2cap_frame *frame, uint8_t ctype,
-					uint8_t len, uint8_t indent)
+static bool avrcp_displayable_charset(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	uint8_t num;
 
 	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
@@ -884,10 +1012,439 @@ static bool avrcp_displayable_charset(struct l2cap_frame *frame, uint8_t ctype,
 	return true;
 }
 
+static bool avrcp_get_element_attributes(struct avctp_frame *avctp_frame,
+						uint8_t ctype, uint8_t len,
+						uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint64_t id;
+	uint8_t num;
+
+	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
+		goto response;
+
+	if (!l2cap_frame_get_be64(frame, &id))
+		return false;
+
+	print_field("%*cIdentifier: 0x%jx (%s)", (indent - 8), ' ',
+					id, id ? "Reserved" : "PLAYING");
+
+	if (!l2cap_frame_get_u8(frame, &num))
+		return false;
+
+	print_field("%*cAttributeCount: 0x%02x", (indent - 8), ' ', num);
+
+	for (; num > 0; num--) {
+		uint32_t attr;
+
+		if (!l2cap_frame_get_be32(frame, &attr))
+			return false;
+
+		print_field("%*cAttribute: 0x%08x (%s)", (indent - 8),
+					' ', attr, mediattr2str(attr));
+	}
+
+	return true;
+
+response:
+	switch (avctp_frame->pt) {
+	case AVRCP_PACKET_TYPE_SINGLE:
+	case AVRCP_PACKET_TYPE_START:
+		if (!l2cap_frame_get_u8(frame, &num))
+			return false;
+
+		avrcp_continuing.num = num;
+		print_field("%*cAttributeCount: 0x%02x", (indent - 8),
+								' ', num);
+		len--;
+		break;
+	case AVRCP_PACKET_TYPE_CONTINUING:
+	case AVRCP_PACKET_TYPE_END:
+		num = avrcp_continuing.num;
+
+		if (avrcp_continuing.size > 0) {
+			uint16_t size;
+
+			if (avrcp_continuing.size > len) {
+				size = len;
+				avrcp_continuing.size -= len;
+			} else {
+				size = avrcp_continuing.size;
+				avrcp_continuing.size = 0;
+			}
+
+			printf("ContinuingAttributeValue: ");
+			for (; size > 0; size--) {
+				uint8_t c;
+
+				if (!l2cap_frame_get_u8(frame, &c))
+					goto failed;
+
+				printf("%1c", isprint(c) ? c : '.');
+			}
+			printf("\n");
+
+			len -= size;
+		}
+		break;
+	default:
+		goto failed;
+	}
+
+	while (num > 0 && len > 0) {
+		uint32_t attr;
+		uint16_t charset, attrlen;
+
+		if (!l2cap_frame_get_be32(frame, &attr))
+			goto failed;
+
+		print_field("%*cAttribute: 0x%08x (%s)", (indent - 8),
+						' ', attr, mediattr2str(attr));
+
+		if (!l2cap_frame_get_be16(frame, &charset))
+			goto failed;
+
+		print_field("%*cCharsetID: 0x%04x (%s)", (indent - 8),
+				' ', charset, charset2str(charset));
+
+		if (!l2cap_frame_get_be16(frame, &attrlen))
+			goto failed;
+
+		print_field("%*cAttributeValueLength: 0x%04x",
+						(indent - 8), ' ', attrlen);
+
+		len -= sizeof(attr) + sizeof(charset) + sizeof(attrlen);
+		num--;
+
+		print_field("%*cAttributeValue: ", (indent - 8), ' ');
+		for (; attrlen > 0 && len > 0; attrlen--, len--) {
+			uint8_t c;
+
+			if (!l2cap_frame_get_u8(frame, &c))
+				goto failed;
+
+			printf("%1c", isprint(c) ? c : '.');
+		}
+
+		if (attrlen > 0)
+			avrcp_continuing.size = attrlen;
+	}
+
+	avrcp_continuing.num = num;
+	return true;
+
+failed:
+	avrcp_continuing.num = 0;
+	avrcp_continuing.size = 0;
+	return false;
+}
+
+static bool avrcp_get_play_status(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint32_t interval;
+	uint8_t status;
+
+	if (ctype <= AVC_CTYPE_GENERAL_INQUIRY)
+		return true;
+
+	if (!l2cap_frame_get_be32(frame, &interval))
+		return false;
+
+	print_field("%*cSongLength: 0x%08x (%u miliseconds)",
+					(indent - 8), ' ', interval, interval);
+
+	if (!l2cap_frame_get_be32(frame, &interval))
+		return false;
+
+	print_field("%*cSongPosition: 0x%08x (%u miliseconds)",
+					(indent - 8), ' ', interval, interval);
+
+	if (!l2cap_frame_get_u8(frame, &status))
+		return false;
+
+	print_field("%*cPlayStatus: 0x%02x (%s)", (indent - 8),
+					' ', status, playstatus2str(status));
+
+	return true;
+}
+
+static bool avrcp_register_notification(struct avctp_frame *avctp_frame,
+					uint8_t ctype, uint8_t len,
+					uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint8_t event, status;
+	uint16_t uid;
+	uint32_t interval;
+	uint64_t id;
+
+	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
+		goto response;
+
+	if (!l2cap_frame_get_u8(frame, &event))
+		return false;
+
+	print_field("%*cEventID: 0x%02x (%s)", (indent - 8),
+						' ', event, event2str(event));
+
+	if (!l2cap_frame_get_be32(frame, &interval))
+		return false;
+
+	print_field("%*cInterval: 0x%08x (%u seconds)",
+					(indent - 8), ' ', interval, interval);
+
+	return true;
+
+response:
+	if (!l2cap_frame_get_u8(frame, &event))
+		return false;
+
+	print_field("%*cEventID: 0x%02x (%s)", (indent - 8),
+						' ', event, event2str(event));
+
+	switch (event) {
+	case AVRCP_EVENT_PLAYBACK_STATUS_CHANGED:
+		if (!l2cap_frame_get_u8(frame, &status))
+			return false;
+
+		print_field("%*cPlayStatus: 0x%02x (%s)", (indent - 8),
+					' ', status, playstatus2str(status));
+		break;
+	case AVRCP_EVENT_TRACK_CHANGED:
+		if (!l2cap_frame_get_be64(frame, &id))
+			return false;
+
+		print_field("%*cIdentifier: 0x%16" PRIx64 " (%" PRIu64 ")",
+						(indent - 8), ' ', id, id);
+		break;
+	case AVRCP_EVENT_PLAYBACK_POS_CHANGED:
+		if (!l2cap_frame_get_be32(frame, &interval))
+			return false;
+
+		print_field("%*cPosition: 0x%08x (%u miliseconds)",
+					(indent - 8), ' ', interval, interval);
+		break;
+	case AVRCP_EVENT_BATT_STATUS_CHANGED:
+		if (!l2cap_frame_get_u8(frame, &status))
+			return false;
+
+		print_field("%*cBatteryStatus: 0x%02x (%s)", (indent - 8),
+					' ', status, status2str(status));
+
+		break;
+	case AVRCP_EVENT_SYSTEM_STATUS_CHANGED:
+		if (!l2cap_frame_get_u8(frame, &status))
+			return false;
+
+		print_field("%*cSystemStatus: 0x%02x ", (indent - 8),
+								' ', status);
+		switch (status) {
+		case 0x00:
+			printf("(POWER_ON)\n");
+			break;
+		case 0x01:
+			printf("(POWER_OFF)\n");
+			break;
+		case 0x02:
+			printf("(UNPLUGGED)\n");
+			break;
+		default:
+			printf("(UNKOWN)\n");
+			break;
+		}
+		break;
+	case AVRCP_EVENT_PLAYER_APPLICATION_SETTING_CHANGED:
+		if (!l2cap_frame_get_u8(frame, &status))
+			return false;
+
+		print_field("%*cAttributeCount: 0x%02x", (indent - 8),
+								' ', status);
+
+		for (; status > 0; status--) {
+			uint8_t attr, value;
+
+			if (!l2cap_frame_get_u8(frame, &attr))
+				return false;
+
+			print_field("%*cAttributeID: 0x%02x (%s)",
+				(indent - 8), ' ', attr, attr2str(attr));
+
+			if (!l2cap_frame_get_u8(frame, &value))
+				return false;
+
+			print_field("%*cValueID: 0x%02x (%s)", (indent - 8),
+					' ', value, value2str(attr, value));
+		}
+		break;
+	case AVRCP_EVENT_VOLUME_CHANGED:
+		if (!l2cap_frame_get_u8(frame, &status))
+			return false;
+
+		status &= 0x7F;
+
+		print_field("%*cVolume: %.2f%% (%d/127)", (indent - 8),
+						' ', status/1.27, status);
+		break;
+	case AVRCP_EVENT_ADDRESSED_PLAYER_CHANGED:
+		if (!l2cap_frame_get_be16(frame, &uid))
+			return false;
+
+		print_field("%*cPlayerID: 0x%04x (%u)", (indent - 8),
+								' ', uid, uid);
+
+		if (!l2cap_frame_get_be16(frame, &uid))
+			return false;
+
+		print_field("%*cUIDCounter: 0x%04x (%u)", (indent - 8),
+								' ', uid, uid);
+		break;
+	case AVRCP_EVENT_UIDS_CHANGED:
+		if (!l2cap_frame_get_be16(frame, &uid))
+			return false;
+
+		print_field("%*cUIDCounter: 0x%04x (%u)", (indent - 8),
+								' ', uid, uid);
+		break;
+	}
+
+	return true;
+}
+
+static bool avrcp_set_absolute_volume(struct avctp_frame *avctp_frame,
+						uint8_t ctype, uint8_t len,
+						uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint8_t value;
+
+	if (!l2cap_frame_get_u8(frame, &value))
+		return false;
+
+	value &= 0x7F;
+	print_field("%*cVolume: %.2f%% (%d/127)", (indent - 8),
+						' ', value/1.27, value);
+
+	return true;
+}
+
+static bool avrcp_set_addressed_player(struct avctp_frame *avctp_frame,
+						uint8_t ctype, uint8_t len,
+						uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint16_t id;
+	uint8_t status;
+
+	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
+		goto response;
+
+	if (!l2cap_frame_get_be16(frame, &id))
+		return false;
+
+	print_field("%*cPlayerID: 0x%04x (%u)", (indent - 8), ' ', id, id);
+
+	return true;
+
+response:
+	if (!l2cap_frame_get_u8(frame, &status))
+		return false;
+
+	print_field("%*cStatus: 0x%02x (%s)", (indent - 8), ' ',
+						status, error2str(status));
+
+	return true;
+}
+
+static bool avrcp_play_item(struct avctp_frame *avctp_frame, uint8_t ctype,
+						uint8_t len, uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint64_t uid;
+	uint16_t uidcounter;
+	uint8_t scope, status;
+
+	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
+		goto response;
+
+	if (!l2cap_frame_get_u8(frame, &scope))
+		return false;
+
+	print_field("%*cScope: 0x%02x (%s)", (indent - 8), ' ',
+						scope, scope2str(scope));
+
+	if (!l2cap_frame_get_be64(frame, &uid))
+		return false;
+
+	print_field("%*cUID: 0x%16" PRIx64 " (%" PRIu64 ")", (indent - 8),
+								' ', uid, uid);
+
+	if (!l2cap_frame_get_be16(frame, &uidcounter))
+		return false;
+
+	print_field("%*cUIDCounter: 0x%04x (%u)", (indent - 8), ' ',
+							uidcounter, uidcounter);
+
+	return true;
+
+response:
+	if (!l2cap_frame_get_u8(frame, &status))
+		return false;
+
+	print_field("%*cStatus: 0x%02x (%s)", (indent - 8), ' ', status,
+							error2str(status));
+
+	return true;
+}
+
+static bool avrcp_add_to_now_playing(struct avctp_frame *avctp_frame,
+						uint8_t ctype, uint8_t len,
+						uint8_t indent)
+{
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint64_t uid;
+	uint16_t uidcounter;
+	uint8_t scope, status;
+
+	if (ctype > AVC_CTYPE_GENERAL_INQUIRY)
+		goto response;
+
+	if (!l2cap_frame_get_u8(frame, &scope))
+		return false;
+
+	print_field("%*cScope: 0x%02x (%s)", (indent - 8), ' ',
+						scope, scope2str(scope));
+
+	if (!l2cap_frame_get_be64(frame, &uid))
+		return false;
+
+	print_field("%*cUID: 0x%16" PRIx64 " (%" PRIu64 ")", (indent - 8),
+								' ', uid, uid);
+
+	if (!l2cap_frame_get_be16(frame, &uidcounter))
+		return false;
+
+	print_field("%*cUIDCounter: 0x%04x (%u)", (indent - 8), ' ',
+							uidcounter, uidcounter);
+
+	return true;
+
+response:
+	if (!l2cap_frame_get_u8(frame, &status))
+		return false;
+
+	print_field("%*cStatus: 0x%02x (%s)", (indent - 8), ' ', status,
+							error2str(status));
+
+	return true;
+}
+
 struct avrcp_ctrl_pdu_data {
 	uint8_t pduid;
-	bool (*func) (struct l2cap_frame *frame, uint8_t ctype, uint8_t len,
-							uint8_t indent);
+	bool (*func) (struct avctp_frame *avctp_frame, uint8_t ctype,
+						uint8_t len, uint8_t indent);
 };
 
 static const struct avrcp_ctrl_pdu_data avrcp_ctrl_pdu_table[] = {
@@ -899,6 +1456,13 @@ static const struct avrcp_ctrl_pdu_data avrcp_ctrl_pdu_table[] = {
 	{ 0x15, avrcp_get_player_attribute_text		},
 	{ 0x16, avrcp_get_player_value_text		},
 	{ 0x17, avrcp_displayable_charset		},
+	{ 0x20, avrcp_get_element_attributes		},
+	{ 0x30, avrcp_get_play_status			},
+	{ 0x31, avrcp_register_notification		},
+	{ 0x50, avrcp_set_absolute_volume		},
+	{ 0x60, avrcp_set_addressed_player		},
+	{ 0x74, avrcp_play_item				},
+	{ 0x90, avrcp_add_to_now_playing		},
 	{ }
 };
 
@@ -915,10 +1479,11 @@ static bool avrcp_rejected_packet(struct l2cap_frame *frame, uint8_t indent)
 	return true;
 }
 
-static bool avrcp_pdu_packet(struct l2cap_frame *frame, uint8_t ctype,
+static bool avrcp_pdu_packet(struct avctp_frame *avctp_frame, uint8_t ctype,
 								uint8_t indent)
 {
-	uint8_t pduid, pt;
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+	uint8_t pduid;
 	uint16_t len;
 	int i;
 	const struct avrcp_ctrl_pdu_data *ctrl_pdu_data = NULL;
@@ -926,14 +1491,14 @@ static bool avrcp_pdu_packet(struct l2cap_frame *frame, uint8_t ctype,
 	if (!l2cap_frame_get_u8(frame, &pduid))
 		return false;
 
-	if (!l2cap_frame_get_u8(frame, &pt))
+	if (!l2cap_frame_get_u8(frame, &avctp_frame->pt))
 		return false;
 
 	if (!l2cap_frame_get_be16(frame, &len))
 		return false;
 
 	print_indent(indent, COLOR_OFF, "AVRCP: ", pdu2str(pduid), COLOR_OFF,
-					" pt %s len 0x%04x", pt2str(pt), len);
+			" pt %s len 0x%04x", pt2str(avctp_frame->pt), len);
 
 	if (frame->size != len)
 		return false;
@@ -953,11 +1518,13 @@ static bool avrcp_pdu_packet(struct l2cap_frame *frame, uint8_t ctype,
 		return true;
 	}
 
-	return ctrl_pdu_data->func(frame, ctype, len, indent + 2);
+	return ctrl_pdu_data->func(avctp_frame, ctype, len, indent + 2);
 }
 
-static bool avrcp_control_packet(struct l2cap_frame *frame)
+static bool avrcp_control_packet(struct avctp_frame *avctp_frame)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+
 	uint8_t ctype, address, subunit, opcode, company[3], indent = 2;
 
 	if (!l2cap_frame_get_u8(frame, &ctype) ||
@@ -988,7 +1555,7 @@ static bool avrcp_control_packet(struct l2cap_frame *frame)
 
 	switch (opcode) {
 	case 0x7c:
-		return avrcp_passthrough_packet(frame);
+		return avrcp_passthrough_packet(avctp_frame);
 	case 0x00:
 		if (!l2cap_frame_get_u8(frame, &company[0]) ||
 				!l2cap_frame_get_u8(frame, &company[1]) ||
@@ -998,29 +1565,32 @@ static bool avrcp_control_packet(struct l2cap_frame *frame)
 		print_field("%*cCompany ID: 0x%02x%02x%02x", indent, ' ',
 					company[0], company[1], company[2]);
 
-		return avrcp_pdu_packet(frame, ctype, 10);
+		return avrcp_pdu_packet(avctp_frame, ctype, 10);
 	default:
 		packet_hexdump(frame->data, frame->size);
 		return true;
 	}
 }
 
-static bool avrcp_browsing_packet(struct l2cap_frame *frame, uint8_t hdr)
+static bool avrcp_browsing_packet(struct avctp_frame *avctp_frame)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
+
 	packet_hexdump(frame->data, frame->size);
 	return true;
 }
 
-static void avrcp_packet(struct l2cap_frame *frame, uint8_t hdr)
+static void avrcp_packet(struct avctp_frame *avctp_frame)
 {
+	struct l2cap_frame *frame = &avctp_frame->l2cap_frame;
 	bool ret;
 
 	switch (frame->psm) {
 	case 0x17:
-		ret = avrcp_control_packet(frame);
+		ret = avrcp_control_packet(avctp_frame);
 		break;
 	case 0x1B:
-		ret = avrcp_browsing_packet(frame, hdr);
+		ret = avrcp_browsing_packet(avctp_frame);
 		break;
 	default:
 		packet_hexdump(frame->data, frame->size);
@@ -1035,15 +1605,16 @@ static void avrcp_packet(struct l2cap_frame *frame, uint8_t hdr)
 
 void avctp_packet(const struct l2cap_frame *frame)
 {
-	uint8_t hdr;
-	uint16_t pid;
-	struct l2cap_frame avctp_frame;
+	struct l2cap_frame *l2cap_frame;
+	struct avctp_frame avctp_frame;
 	const char *pdu_color;
 
-	l2cap_frame_pull(&avctp_frame, frame, 0);
+	l2cap_frame_pull(&avctp_frame.l2cap_frame, frame, 0);
 
-	if (!l2cap_frame_get_u8(&avctp_frame, &hdr) ||
-				!l2cap_frame_get_be16(&avctp_frame, &pid)) {
+	l2cap_frame = &avctp_frame.l2cap_frame;
+
+	if (!l2cap_frame_get_u8(l2cap_frame, &avctp_frame.hdr) ||
+			!l2cap_frame_get_be16(l2cap_frame, &avctp_frame.pid)) {
 		print_text(COLOR_ERROR, "frame too short");
 		packet_hexdump(frame->data, frame->size);
 		return;
@@ -1057,11 +1628,12 @@ void avctp_packet(const struct l2cap_frame *frame)
 	print_indent(6, pdu_color, "AVCTP", "", COLOR_OFF,
 				" %s: %s: type 0x%02x label %d PID 0x%04x",
 				frame->psm == 23 ? "Control" : "Browsing",
-				hdr & 0x02 ? "Response" : "Command",
-				hdr & 0x0c, hdr >> 4, pid);
+				avctp_frame.hdr & 0x02 ? "Response" : "Command",
+				avctp_frame.hdr & 0x0c, avctp_frame.hdr >> 4,
+				avctp_frame.pid);
 
-	if (pid == 0x110e || pid == 0x110c)
-		avrcp_packet(&avctp_frame, hdr);
+	if (avctp_frame.pid == 0x110e || avctp_frame.pid == 0x110c)
+		avrcp_packet(&avctp_frame);
 	else
 		packet_hexdump(frame->data, frame->size);
 }

@@ -14,6 +14,10 @@ BLUEZ_COMMON_CFLAGS := -DVERSION=\"$(BLUEZ_VERSION)\" \
 			-DANDROID_VERSION=$(ANDROID_VERSION) \
 			-DANDROID_STORAGEDIR=\"/data/misc/bluetooth\" \
 
+ifeq ($(BLUEZ_EXTENSIONS), true)
+BLUEZ_COMMON_CFLAGS += -DBLUEZ_EXTENSIONS
+endif
+
 # Enable warnings enabled in autotools build
 BLUEZ_COMMON_CFLAGS += -Wall -Wextra \
 			-Wdeclaration-after-statement \
@@ -49,9 +53,10 @@ LOCAL_SRC_FILES := \
 	bluez/android/avrcp-lib.c \
 	bluez/android/pan.c \
 	bluez/android/handsfree.c \
+	bluez/android/handsfree-client.c \
 	bluez/android/gatt.c \
 	bluez/android/health.c \
-	bluez/android/mcap-lib.c \
+	bluez/profiles/health/mcap.c \
 	bluez/src/log.c \
 	bluez/src/shared/mgmt.c \
 	bluez/src/shared/util.c \
@@ -128,6 +133,10 @@ LOCAL_SRC_FILES := \
 	bluez/android/hal-utils.c \
 	bluez/android/hal-health.c \
 
+ifeq ($(BLUEZ_EXTENSIONS), true)
+LOCAL_SRC_FILES += bluez/android/hal-handsfree-client.c
+endif
+
 LOCAL_C_INCLUDES += \
 	$(call include-path-for, system-core) \
 	$(call include-path-for, libhardware) \
@@ -170,6 +179,10 @@ LOCAL_SRC_FILES := \
 	bluez/android/client/if-gatt.c \
 	bluez/android/hal-utils.c \
 
+ifeq ($(BLUEZ_EXTENSIONS), true)
+LOCAL_SRC_FILES += bluez/android/client/if-hf-client.c
+endif
+
 LOCAL_C_INCLUDES += \
 	$(call include-path-for, system-core) \
 	$(call include-path-for, libhardware) \
@@ -198,8 +211,8 @@ LOCAL_SRC_FILES := \
 	bluez/btio/btio.c \
 	bluez/lib/bluetooth.c \
 	bluez/lib/hci.c \
-	bluez/android/mcap-lib.c \
-	bluez/android/mcaptest.c \
+	bluez/profiles/health/mcap.c \
+	bluez/tools/mcaptest.c \
 
 LOCAL_C_INCLUDES := \
 	$(call include-path-for, glib) \
@@ -334,7 +347,6 @@ include $(BUILD_EXECUTABLE)
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := \
-	bluez/src/shared/queue.c \
 	bluez/android/hal-audio.c \
 	bluez/android/hal-audio-sbc.c \
 	bluez/android/hal-audio-aptx.c \
@@ -463,6 +475,7 @@ LOCAL_SRC_FILES := \
 	bluez/src/shared/mgmt.c \
 	bluez/src/shared/queue.c \
 	bluez/src/shared/util.c \
+	bluez/src/shared/gap.c \
 	bluez/src/uuid-helper.c \
 
 LOCAL_C_INCLUDES := \
@@ -627,7 +640,8 @@ ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := \
-	bluez/android/bluetoothd-wrapper.c
+	bluez/android/bluetoothd-wrapper.c \
+	bluez/android/hal-utils.c
 
 LOCAL_CFLAGS := $(BLUEZ_COMMON_CFLAGS)
 

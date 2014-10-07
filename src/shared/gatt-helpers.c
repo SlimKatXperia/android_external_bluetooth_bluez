@@ -482,11 +482,11 @@ static void read_by_grp_type_cb(uint8_t opcode, const void *pdu,
 	}
 
 	last_end = get_le16(pdu + length - data_length + 2);
-	if (last_end != 0xffff) {
+	if (last_end < op->end_handle) {
 		uint8_t pdu[6];
 
 		put_le16(last_end + 1, pdu);
-		put_le16(0xffff, pdu + 2);
+		put_le16(op->end_handle, pdu + 2);
 		put_le16(GATT_PRIM_SVC_UUID, pdu + 4);
 
 		if (bt_att_send(op->att, BT_ATT_OP_READ_BY_GRP_TYPE_REQ,
@@ -500,6 +500,15 @@ static void read_by_grp_type_cb(uint8_t opcode, const void *pdu,
 		success = false;
 		goto done;
 	}
+
+	/* Some devices incorrectly return 0xffff as the end group handle when
+	 * the read-by-group-type request is performed within a smaller range.
+	 * Manually set the end group handle that we report in the result to the
+	 * end handle in the original request.
+	 */
+	if (last_end == 0xffff && last_end != op->end_handle)
+		put_le16(op->end_handle,
+				cur_result->pdu + length - data_length + 1);
 
 success:
 	/* End of procedure */
@@ -555,11 +564,11 @@ static void find_by_type_val_cb(uint8_t opcode, const void *pdu,
 	}
 
 	last_end = get_le16(pdu + length - 6);
-	if (last_end != 0xffff) {
+	if (last_end < op->end_handle) {
 		uint8_t pdu[6 + get_uuid_len(&op->uuid)];
 
 		put_le16(last_end + 1, pdu);
-		put_le16(0xffff, pdu + 2);
+		put_le16(op->end_handle, pdu + 2);
 		put_le16(GATT_PRIM_SVC_UUID, pdu + 4);
 		put_uuid_le(&op->uuid, pdu + 6);
 
@@ -585,8 +594,18 @@ done:
 		op->callback(success, att_ecode, final_result, op->user_data);
 }
 
-bool bt_gatt_discover_primary_services(struct bt_att *att,
-					bt_uuid_t *uuid,
+bool bt_gatt_discover_all_primary_services(struct bt_att *att, bt_uuid_t *uuid,
+					bt_gatt_discovery_callback_t callback,
+					void *user_data,
+					bt_gatt_destroy_func_t destroy)
+{
+	return bt_gatt_discover_primary_services(att, uuid, 0x0001, 0xffff,
+							callback, user_data,
+							destroy);
+}
+
+bool bt_gatt_discover_primary_services(struct bt_att *att, bt_uuid_t *uuid,
+					uint16_t start, uint16_t end,
 					bt_gatt_discovery_callback_t callback,
 					void *user_data,
 					bt_gatt_destroy_func_t destroy)
@@ -602,6 +621,7 @@ bool bt_gatt_discover_primary_services(struct bt_att *att,
 		return false;
 
 	op->att = att;
+	op->end_handle = end;
 	op->callback = callback;
 	op->user_data = user_data;
 	op->destroy = destroy;
@@ -610,8 +630,8 @@ bool bt_gatt_discover_primary_services(struct bt_att *att,
 	if (!uuid) {
 		uint8_t pdu[6];
 
-		put_le16(0x0001, pdu);
-		put_le16(0xffff, pdu + 2);
+		put_le16(start, pdu);
+		put_le16(end, pdu + 2);
 		put_le16(GATT_PRIM_SVC_UUID, pdu + 4);
 
 		result = bt_att_send(att, BT_ATT_OP_READ_BY_GRP_TYPE_REQ,
@@ -630,8 +650,8 @@ bool bt_gatt_discover_primary_services(struct bt_att *att,
 		/* Discover by UUID */
 		op->uuid = *uuid;
 
-		put_le16(0x0001, pdu);
-		put_le16(0xffff, pdu + 2);
+		put_le16(start, pdu);
+		put_le16(end, pdu + 2);
 		put_le16(GATT_PRIM_SVC_UUID, pdu + 4);
 		put_uuid_le(&op->uuid, pdu + 6);
 
@@ -910,71 +930,4 @@ bool bt_gatt_discover_descriptors(struct bt_att *att,
 	}
 
 	return true;
-}
-
-struct notify_data {
-	struct bt_att *att;
-	bt_gatt_notify_callback_t callback;
-	void *user_data;
-	bt_gatt_destroy_func_t destroy;
-};
-
-static void notify_data_destroy(void *data)
-{
-	struct notify_data *notd = data;
-
-	if (notd->destroy)
-		notd->destroy(notd->user_data);
-
-	free(notd);
-}
-
-static void notify_cb(uint8_t opcode, const void *pdu, uint16_t length,
-								void *user_data)
-{
-	struct notify_data *data = user_data;
-	uint16_t value_handle;
-	const uint8_t *value = NULL;
-
-	value_handle = get_le16(pdu);
-
-	if (length > 2)
-		value = pdu + 2;
-
-	if (data->callback)
-		data->callback(value_handle, value, length - 2, data->user_data);
-
-	if (opcode == BT_ATT_OP_HANDLE_VAL_IND)
-		bt_att_send(data->att, BT_ATT_OP_HANDLE_VAL_CONF, NULL, 0,
-							NULL, NULL, NULL);
-}
-
-unsigned int bt_gatt_register(struct bt_att *att, bool indications,
-					bt_gatt_notify_callback_t callback,
-					void *user_data,
-					bt_gatt_destroy_func_t destroy)
-{
-	struct notify_data *data;
-	uint8_t opcode;
-	unsigned int id;
-
-	if (!att)
-		return 0;
-
-	data = new0(struct notify_data, 1);
-	if (!data)
-		return 0;
-
-	data->att = att;
-	data->callback = callback;
-	data->user_data = user_data;
-	data->destroy = destroy;
-
-	opcode = indications ? BT_ATT_OP_HANDLE_VAL_IND : BT_ATT_OP_HANDLE_VAL_NOT;
-
-	id = bt_att_register(att, opcode, notify_cb, data, notify_data_destroy);
-	if (!id)
-		free(data);
-
-	return id;
 }

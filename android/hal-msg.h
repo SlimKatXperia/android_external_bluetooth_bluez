@@ -35,8 +35,9 @@ static const char BLUEZ_HAL_SK_PATH[] = "\0bluez_hal_socket";
 #define HAL_SERVICE_ID_HEALTH		7
 #define HAL_SERVICE_ID_AVRCP		8
 #define HAL_SERVICE_ID_GATT		9
+#define HAL_SERVICE_ID_HANDSFREE_CLIENT	10
 
-#define HAL_SERVICE_ID_MAX HAL_SERVICE_ID_GATT
+#define HAL_SERVICE_ID_MAX HAL_SERVICE_ID_HANDSFREE_CLIENT
 
 /* Core Service */
 
@@ -67,6 +68,27 @@ struct hal_cmd_register_module {
 #define HAL_OP_UNREGISTER_MODULE	0x02
 struct hal_cmd_unregister_module {
 	uint8_t service_id;
+} __attribute__((packed));
+
+#define HAL_CONFIG_VENDOR		0x00
+#define HAL_CONFIG_MODEL		0x01
+#define HAL_CONFIG_NAME			0x02
+#define HAL_CONFIG_SERIAL_NUMBER	0x03
+#define HAL_CONFIG_SYSTEM_ID		0x04
+#define HAL_CONFIG_PNP_ID		0x05
+#define HAL_CONFIG_FW_REV		0x06
+#define HAL_CONFIG_HW_REV		0x07
+
+struct hal_config_prop {
+	uint8_t type;
+	uint16_t len;
+	uint8_t val[0];
+} __attribute__((packed));
+
+#define HAL_OP_CONFIGURATION		0x03
+struct hal_cmd_configuration {
+	uint8_t num;
+	struct hal_config_prop props[0];
 } __attribute__((packed));
 
 /* Bluetooth Core HAL API */
@@ -566,6 +588,110 @@ struct hal_cmd_handsfree_phone_state_change {
 	uint8_t number[0];
 } __attribute__((packed));
 
+/* AVRCP HAL API */
+
+#define HAL_AVRCP_PLAY_STATUS_STOPPED	0x00
+#define HAL_AVRCP_PLAY_STATUS_PLAYING	0x01
+#define HAL_AVRCP_PLAY_STATUS_PAUSED	0x02
+#define HAL_AVRCP_PLAY_STATUS_FWD_SEEK	0x03
+#define HAL_AVRCP_PLAY_STATUS_REV_SEEK	0x04
+#define HAL_AVRCP_PLAY_STATUS_ERROR	0xff
+
+#define HAL_OP_AVRCP_GET_PLAY_STATUS	0x01
+struct hal_cmd_avrcp_get_play_status {
+	uint8_t status;
+	uint32_t duration;
+	uint32_t position;
+} __attribute__((packed));
+
+#define HAL_AVRCP_PLAYER_ATTR_EQUALIZER	0x01
+#define HAL_AVRCP_PLAYER_ATTR_REPEAT	0x02
+#define HAL_AVRCP_PLAYER_ATTR_SHUFFLE	0x03
+#define HAL_AVRCP_PLAYER_ATTR_SCAN	0x04
+
+#define HAL_OP_AVRCP_LIST_PLAYER_ATTRS	0x02
+struct hal_cmd_avrcp_list_player_attrs {
+	uint8_t number;
+	uint8_t attrs[0];
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_LIST_PLAYER_VALUES	0x03
+struct hal_cmd_avrcp_list_player_values {
+	uint8_t number;
+	uint8_t values[0];
+} __attribute__((packed));
+
+struct hal_avrcp_player_attr_value {
+	uint8_t attr;
+	uint8_t value;
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_GET_PLAYER_ATTRS	0x04
+struct hal_cmd_avrcp_get_player_attrs {
+	uint8_t number;
+	struct hal_avrcp_player_attr_value attrs[0];
+} __attribute__((packed));
+
+struct hal_avrcp_player_setting_text {
+	uint8_t id;
+	uint8_t len;
+	uint8_t text[0];
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_GET_PLAYER_ATTRS_TEXT	0x05
+struct hal_cmd_avrcp_get_player_attrs_text {
+	uint8_t number;
+	struct hal_avrcp_player_setting_text attrs[0];
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_GET_PLAYER_VALUES_TEXT	0x06
+struct hal_cmd_avrcp_get_player_values_text {
+	uint8_t number;
+	struct hal_avrcp_player_setting_text values[0];
+} __attribute__((packed));
+
+#define HAL_AVRCP_MEDIA_ATTR_TITLE		0x01
+#define HAL_AVRCP_MEDIA_ATTR_ARTIST		0x02
+#define HAL_AVRCP_MEDIA_ATTR_ALBUM		0x03
+#define HAL_AVRCP_MEDIA_ATTR_TRACK_NUM		0x04
+#define HAL_AVRCP_MEDIA_ATTR_NUM_TRACKS		0x05
+#define HAL_AVRCP_MEDIA_ATTR_GENRE		0x06
+#define HAL_AVRCP_MEDIA_ATTR_DURATION		0x07
+
+#define HAL_OP_AVRCP_GET_ELEMENT_ATTRS_TEXT	0x07
+struct hal_cmd_avrcp_get_element_attrs_text {
+	uint8_t number;
+	struct hal_avrcp_player_setting_text values[0];
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_SET_PLAYER_ATTRS_VALUE	0x08
+struct hal_cmd_avrcp_set_player_attrs_value {
+	uint8_t status;
+} __attribute__((packed));
+
+#define HAL_AVRCP_EVENT_STATUS_CHANGED		0x01
+#define HAL_AVRCP_EVENT_TRACK_CHANGED		0x02
+#define HAL_AVRCP_EVENT_TRACK_REACHED_END	0x03
+#define HAL_AVRCP_EVENT_TRACK_REACHED_START	0x04
+#define HAL_AVRCP_EVENT_POSITION_CHANGED	0x05
+#define HAL_AVRCP_EVENT_SETTING_CHANGED		0x08
+
+#define HAL_AVRCP_EVENT_TYPE_INTERIM		0x00
+#define HAL_AVRCP_EVENT_TYPE_CHANGED		0x01
+
+#define HAL_OP_AVRCP_REGISTER_NOTIFICATION	0x09
+struct hal_cmd_avrcp_register_notification {
+	uint8_t event;
+	uint8_t type;
+	uint8_t len;
+	uint8_t data[0];
+} __attribute__((packed));
+
+#define HAL_OP_AVRCP_SET_VOLUME			0x0a
+struct hal_cmd_avrcp_set_volume {
+	uint8_t value;
+} __attribute__((packed));
+
 /* GATT HAL API */
 
 #define HAL_OP_GATT_CLIENT_REGISTER		0x01
@@ -871,6 +997,81 @@ struct hal_cmd_gatt_server_send_response {
 	uint8_t data[0];
 } __attribute__((packed));
 
+/* Handsfree client HAL API */
+
+#define HAL_OP_HF_CLIENT_CONNECT		0x01
+struct hal_cmd_hf_client_connect {
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_DISCONNECT		0x02
+struct hal_cmd_hf_client_disconnect {
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_CONNECT_AUDIO		0x03
+struct hal_cmd_hf_client_connect_audio {
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_DISCONNECT_AUDIO	0x04
+struct hal_cmd_hf_client_disconnect_audio {
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_START_VR		0x05
+#define HAL_OP_HF_CLIENT_STOP_VR		0x06
+
+#define HF_CLIENT_VOLUME_TYPE_SPEAKER	0x00
+#define HF_CLIENT_VOLUME_TYPE_MIC	0x01
+
+#define HAL_OP_HF_CLIENT_VOLUME_CONTROL		0x07
+struct hal_cmd_hf_client_volume_control {
+	uint8_t type;
+	uint8_t volume;
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_DIAL			0x08
+struct hal_cmd_hf_client_dial {
+	uint16_t number_len;
+	uint8_t number[0];
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_DIAL_MEMORY		0x09
+struct hal_cmd_hf_client_dial_memory {
+	int32_t location;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_ACTION_CHLD_0		0x00
+#define HAL_HF_CLIENT_ACTION_CHLD_1		0x01
+#define HAL_HF_CLIENT_ACTION_CHLD_2		0x02
+#define HAL_HF_CLIENT_ACTION_CHLD_3		0x03
+#define HAL_HF_CLIENT_ACTION_CHLD_4		0x04
+#define HAL_HF_CLIENT_ACTION_CHLD_1x		0x05
+#define HAL_HF_CLIENT_ACTION_CHLD_2x		0x06
+#define HAL_HF_CLIENT_ACTION_ATA		0x07
+#define HAL_HF_CLIENT_ACTION_CHUP		0x08
+#define HAL_HF_CLIENT_ACTION_BRTH_0		0x09
+#define HAL_HF_CLIENT_ACTION_BRTH_1		0x0a
+#define HAL_HF_CLIENT_ACTION_BRTH_02		0x0b
+
+#define HAL_OP_HF_CLIENT_CALL_ACTION		0x0a
+struct hal_cmd_hf_client_call_action {
+	uint8_t action;
+	uint8_t index;
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_QUERY_CURRENT_CALLS	0x0b
+#define HAL_OP_HF_CLIENT_QUERY_OPERATOR_NAME	0x0c
+#define HAL_OP_HF_CLIENT_RETRIEVE_SUBSCR_INFO	0x0d
+
+#define HAL_OP_HF_CLIENT_SEND_DTMF		0x0e
+struct hal_cmd_hf_client_send_dtmf {
+	uint8_t tone;
+} __attribute__((packed));
+
+#define HAL_OP_HF_CLIENT_GET_LAST_VOICE_TAG_NUM	0x0f
+
 /* Notifications and confirmations */
 
 #define HAL_POWER_OFF			0x00
@@ -1173,110 +1374,6 @@ struct hal_ev_handsfree_unknown_at {
 } __attribute__((packed));
 
 #define HAL_EV_HANDSFREE_HSP_KEY_PRESS	0x90
-
-/* AVRCP HAL API */
-
-#define HAL_AVRCP_PLAY_STATUS_STOPPED	0x00
-#define HAL_AVRCP_PLAY_STATUS_PLAYING	0x01
-#define HAL_AVRCP_PLAY_STATUS_PAUSED	0x02
-#define HAL_AVRCP_PLAY_STATUS_FWD_SEEK	0x03
-#define HAL_AVRCP_PLAY_STATUS_REV_SEEK	0x04
-#define HAL_AVRCP_PLAY_STATUS_ERROR	0xff
-
-#define HAL_OP_AVRCP_GET_PLAY_STATUS	0x01
-struct hal_cmd_avrcp_get_play_status {
-	uint8_t status;
-	uint32_t duration;
-	uint32_t position;
-} __attribute__((packed));
-
-#define HAL_AVRCP_PLAYER_ATTR_EQUALIZER	0x01
-#define HAL_AVRCP_PLAYER_ATTR_REPEAT	0x02
-#define HAL_AVRCP_PLAYER_ATTR_SHUFFLE	0x03
-#define HAL_AVRCP_PLAYER_ATTR_SCAN	0x04
-
-#define HAL_OP_AVRCP_LIST_PLAYER_ATTRS	0x02
-struct hal_cmd_avrcp_list_player_attrs {
-	uint8_t number;
-	uint8_t attrs[0];
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_LIST_PLAYER_VALUES	0x03
-struct hal_cmd_avrcp_list_player_values {
-	uint8_t number;
-	uint8_t values[0];
-} __attribute__((packed));
-
-struct hal_avrcp_player_attr_value {
-	uint8_t attr;
-	uint8_t value;
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_GET_PLAYER_ATTRS	0x04
-struct hal_cmd_avrcp_get_player_attrs {
-	uint8_t number;
-	struct hal_avrcp_player_attr_value attrs[0];
-} __attribute__((packed));
-
-struct hal_avrcp_player_setting_text {
-	uint8_t id;
-	uint8_t len;
-	uint8_t text[0];
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_GET_PLAYER_ATTRS_TEXT	0x05
-struct hal_cmd_avrcp_get_player_attrs_text {
-	uint8_t number;
-	struct hal_avrcp_player_setting_text attrs[0];
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_GET_PLAYER_VALUES_TEXT	0x06
-struct hal_cmd_avrcp_get_player_values_text {
-	uint8_t number;
-	struct hal_avrcp_player_setting_text values[0];
-} __attribute__((packed));
-
-#define HAL_AVRCP_MEDIA_ATTR_TITLE		0x01
-#define HAL_AVRCP_MEDIA_ATTR_ARTIST		0x02
-#define HAL_AVRCP_MEDIA_ATTR_ALBUM		0x03
-#define HAL_AVRCP_MEDIA_ATTR_TRACK_NUM		0x04
-#define HAL_AVRCP_MEDIA_ATTR_NUM_TRACKS		0x05
-#define HAL_AVRCP_MEDIA_ATTR_GENRE		0x06
-#define HAL_AVRCP_MEDIA_ATTR_DURATION		0x07
-
-#define HAL_OP_AVRCP_GET_ELEMENT_ATTRS_TEXT	0x07
-struct hal_cmd_avrcp_get_element_attrs_text {
-	uint8_t number;
-	struct hal_avrcp_player_setting_text values[0];
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_SET_PLAYER_ATTRS_VALUE	0x08
-struct hal_cmd_avrcp_set_player_attrs_value {
-	uint8_t status;
-} __attribute__((packed));
-
-#define HAL_AVRCP_EVENT_STATUS_CHANGED		0x01
-#define HAL_AVRCP_EVENT_TRACK_CHANGED		0x02
-#define HAL_AVRCP_EVENT_TRACK_REACHED_END	0x03
-#define HAL_AVRCP_EVENT_TRACK_REACHED_START	0x04
-#define HAL_AVRCP_EVENT_POSITION_CHANGED	0x05
-#define HAL_AVRCP_EVENT_SETTING_CHANGED		0x08
-
-#define HAL_AVRCP_EVENT_TYPE_INTERIM		0x00
-#define HAL_AVRCP_EVENT_TYPE_CHANGED		0x01
-
-#define HAL_OP_AVRCP_REGISTER_NOTIFICATION	0x09
-struct hal_cmd_avrcp_register_notification {
-	uint8_t event;
-	uint8_t type;
-	uint8_t len;
-	uint8_t data[0];
-} __attribute__((packed));
-
-#define HAL_OP_AVRCP_SET_VOLUME			0x0a
-struct hal_cmd_avrcp_set_volume {
-	uint8_t value;
-} __attribute__((packed));
 
 #define HAL_AVRCP_FEATURE_NONE			0x00
 #define HAL_AVRCP_FEATURE_METADATA		0x01
@@ -1619,3 +1716,203 @@ struct hal_ev_gatt_server_rsp_confirmation {
 #define HAL_GATT_AUTHENTICATION_NONE		0
 #define HAL_GATT_AUTHENTICATION_NO_MITM		1
 #define HAL_GATT_AUTHENTICATION_MITM		2
+
+#define HAL_HF_CLIENT_CONN_STATE_DISCONNECTED		0x00
+#define HAL_HF_CLIENT_CONN_STATE_CONNECTING		0x01
+#define HAL_HF_CLIENT_CONN_STATE_SLC_CONNECTED		0x02
+#define HAL_HF_CLIENT_CONN_STATE_DISCONNECTING		0x03
+
+#define HAL_HF_CLIENT_PEER_FEAT_3WAY		0x00000001
+#define HAL_HF_CLIENT_PEER_FEAT_ECNR		0x00000002
+#define HAL_HF_CLIENT_PEER_FEAT_VREC		0x00000004
+#define HAL_HF_CLIENT_PEER_FEAT_INBAND		0x00000008
+#define HAL_HF_CLIENT_PEER_FEAT_VTAG		0x00000010
+#define HAL_HF_CLIENT_PEER_FEAT_REJECT		0x00000020
+#define HAL_HF_CLIENT_PEER_FEAT_ECS		0x00000040
+#define HAL_HF_CLIENT_PEER_FEAT_ECC		0x00000080
+#define HAL_HF_CLIENT_PEER_FEAT_EXTERR		0x00000100
+#define HAL_HF_CLIENT_PEER_FEAT_CODEC		0x00000200
+
+#define HAL_HF_CLIENT_CHLD_FEAT_REL		0x00000001
+#define HAL_HF_CLIENT_CHLD_FEAT_REL_ACC		0x00000002
+#define HAL_HF_CLIENT_CHLD_FEAT_REL_X		0x00000004
+#define HAL_HF_CLIENT_CHLD_FEAT_HOLD_ACC	0x00000008
+#define HAL_HF_CLIENT_CHLD_FEAT_PRIV_X		0x00000010
+#define HAL_HF_CLIENT_CHLD_FEAT_MERGE		0x00000020
+#define HAL_HF_CLIENT_CHLD_FEAT_MERGE_DETACH	0x00000040
+
+#define HAL_EV_HF_CLIENT_CONN_STATE			0x81
+struct hal_ev_hf_client_conn_state {
+	uint8_t state;
+	uint32_t peer_feat;
+	uint32_t chld_feat;
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_AUDIO_STATE_DISCONNECTED		0x00
+#define HAL_HF_CLIENT_AUDIO_STATE_CONNECTING		0x01
+#define HAL_HF_CLIENT_AUDIO_STATE_CONNECTED		0x02
+#define HAL_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC	0x03
+
+#define HAL_EV_HF_CLIENT_AUDIO_STATE			0x82
+struct hal_ev_hf_client_audio_state {
+	uint8_t state;
+	uint8_t bdaddr[6];
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_VR_STOPPED	0x00
+#define HAL_HF_CLIENT_VR_STARTED	0x01
+
+#define HAL_EV_HF_CLIENT_VR_STATE			0x83
+struct hal_ev_hf_client_vr_state {
+	uint8_t state;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_NET_NOT_AVAILABLE		0x00
+#define HAL_HF_CLIENT_NET_AVAILABLE		0x01
+
+#define HAL_EV_HF_CLIENT_NET_STATE			0x84
+struct hal_ev_hf_client_net_state {
+	uint8_t state;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_NET_ROAMING_TYPE_HOME		0x00
+#define HAL_HF_CLIENT_NET_ROAMING_TYPE_ROAMING		0x01
+
+#define HAL_EV_HF_CLIENT_NET_ROAMING_TYPE		0x85
+struct hal_ev_hf_client_net_roaming_type {
+	uint8_t state;
+} __attribute__((packed));
+
+#define HAL_EV_HF_CLIENT_NET_SIGNAL_STRENGTH		0x86
+struct hal_ev_hf_client_net_signal_strength {
+	uint8_t signal_strength;
+} __attribute__((packed));
+
+#define HAL_EV_HF_CLIENT_BATTERY_LEVEL			0x87
+struct hal_ev_hf_client_battery_level {
+	uint8_t battery_level;
+} __attribute__((packed));
+
+#define HAL_EV_HF_CLIENT_OPERATOR_NAME			0x88
+struct hal_ev_hf_client_operator_name {
+	uint16_t name_len;
+	uint8_t name[0];
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_CALL_IND_NO_CALL_IN_PROGERSS	0x00
+#define HAL_HF_CLIENT_CALL_IND_CALL_IN_PROGERSS		0x01
+
+#define HAL_EV_HF_CLIENT_CALL_INDICATOR			0x89
+struct hal_ev_hf_client_call_indicator {
+	uint8_t call;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_CALL_SETUP_NONE			0x00
+#define HAL_HF_CLIENT_CALL_SETUP_INCOMING		0x01
+#define HAL_HF_CLIENT_CALL_SETUP_OUTGOING		0x02
+#define HAL_HF_CLIENT_CALL_SETUP_ALERTING		0x03
+
+#define HAL_EV_HF_CLIENT_CALL_SETUP_INDICATOR		0x8a
+struct hal_ev_hf_client_call_setup_indicator {
+	uint8_t call_setup;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_CALL_HELD_IND_NONE		0x00
+#define HAL_HF_CLIENT_CALL_HELD_IND_HOLD_AND_ACTIVE	0x01
+#define HAL_HF_CLIENT_CALL_SETUP_IND_HOLD		0x02
+
+#define HAL_EV_HF_CLIENT_CALL_HELD_INDICATOR		0x8b
+struct hal_ev_hf_client_call_held_indicator {
+	uint8_t call_held;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_RESP_AND_HOLD_STATUS_HELD		0x00
+#define HAL_HF_CLIENT_RESP_AND_HOLD_STATUS_ACCEPT	0x01
+#define HAL_HF_CLIENT_RESP_AND_HOLD_STATUS_REJECT	0x02
+
+#define HAL_EV_HF_CLIENT_RESPONSE_AND_HOLD_STATUS	0x8c
+struct hal_ev_hf_client_response_and_hold_status {
+	uint8_t status;
+} __attribute__((packed));
+
+#define HAL_EV_HF_CLIENT_CALLING_LINE_IDENT		0x8d
+struct hal_ev_hf_client_calling_line_ident {
+	uint16_t number_len;
+	uint8_t number[0];
+} __attribute__((packed));
+
+#define HAL_EV_HF_CLIENT_CALL_WAITING			0x8e
+struct hal_ev_hf_client_call_waiting {
+	uint16_t number_len;
+	uint8_t number[0];
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_DIRECTION_OUTGOING	0x00
+#define HAL_HF_CLIENT_DIRECTION_INCOMIGN	0x01
+
+#define HAL_HF_CLIENT_CALL_STATE_ACTIVE			0x00
+#define HAL_HF_CLIENT_CALL_STATE_HELD			0x01
+#define HAL_HF_CLIENT_CALL_STATE_DIALING		0x02
+#define HAL_HF_CLIENT_CALL_STATE_ALERTING		0x03
+#define HAL_HF_CLIENT_CALL_STATE_INCOMING		0x04
+#define HAL_HF_CLIENT_CALL_STATE_WAITING		0x05
+#define HAL_HF_CLIENT_CALL_STATE_HELD_BY_RESP_AND_HOLD	0x06
+
+#define HAL_EV_HF_CLIENT_CURRENT_CALL			0x8f
+struct hal_ev_hf_client_current_call {
+	uint8_t index;
+	uint8_t direction;
+	uint8_t call_state;
+	uint8_t multiparty;
+	uint16_t number_len;
+	uint8_t number[0];
+} __attribute__((packed));
+
+#define HAL_EV_CLIENT_VOLUME_CHANGED			0x90
+struct hal_ev_hf_client_volume_changed {
+	uint8_t type;
+	uint8_t volume;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_CMD_COMP_OK			0x00
+#define HAL_HF_CLIENT_CMD_COMP_ERR			0x01
+#define HAL_HF_CLIENT_CMD_COMP_ERR_NO_CARRIER		0x02
+#define HAL_HF_CLIENT_CMD_COMP_ERR_BUSY			0x03
+#define HAL_HF_CLIENT_CMD_COMP_ERR_NO_ANSWER		0x04
+#define HAL_HF_CLIENT_CMD_COMP_ERR_DELAYED		0x05
+#define HAL_HF_CLIENT_CMD_COMP_ERR_BACKLISTED		0x06
+#define HAL_HF_CLIENT_CMD_COMP_ERR_CME			0x07
+
+#define HAL_EV_CLIENT_COMMAND_COMPLETE			0x91
+struct hal_ev_hf_client_command_complete {
+	uint8_t type;
+	uint8_t cme;
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_SUBSCR_TYPE_UNKNOWN	0x00
+#define HAL_HF_CLIENT_SUBSCR_TYPE_VOICE		0x01
+#define HAL_HF_CLIENT_SUBSCR_TYPE_FAX		0x02
+
+#define HAL_EV_CLIENT_SUBSCRIBER_SERVICE_INFO		0x92
+struct hal_ev_hf_client_subscriber_service_info {
+	uint8_t type;
+	uint16_t name_len;
+	uint8_t name[0];
+} __attribute__((packed));
+
+#define HAL_HF_CLIENT_INBAND_RINGTONE_NOT_PROVIDED	0x00
+#define HAL_HF_CLIENT_INBAND_RINGTONE_PROVIDED		0x01
+
+#define HAL_EV_CLIENT_INBAND_SETTINGS			0x93
+struct hal_ev_hf_client_inband_settings {
+	uint8_t state;
+} __attribute__((packed));
+
+#define HAL_EV_CLIENT_LAST_VOICE_CALL_TAG_NUM		0x94
+struct hal_ev_hf_client_last_void_call_tag_num {
+	uint16_t number_len;
+	uint8_t number[0];
+} __attribute__((packed));
+
+#define HAL_EV_CLIENT_RING_INDICATION			0x95

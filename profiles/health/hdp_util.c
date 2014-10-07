@@ -49,7 +49,6 @@
 #include "src/dbus-common.h"
 
 #include "mcap.h"
-#include "mcap_lib.h"
 #include "hdp_types.h"
 #include "hdp.h"
 #include "hdp_util.h"
